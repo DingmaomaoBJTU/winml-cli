@@ -23,6 +23,7 @@ import ast
 import logging
 from importlib import import_module
 from pathlib import Path
+from time import sleep
 from typing import TYPE_CHECKING
 
 import click
@@ -41,31 +42,39 @@ from .utils.logging import configure_logging, flush_ort_startup_logs
 logger = logging.getLogger(__name__)
 
 _COMMANDS_DIR = Path(__file__).parent / "commands"
-
-# 5-row block-letter art for "WinML CLI".  '#' = filled pixel, ' ' = empty.
-# All letters use the same █ character so identical shapes (i vs I) look
-# consistent regardless of horizontal position.
-_LETTER_ART: dict[str, list[str]] = {
-    "W": ["#   #", "#   #", "# # #", "## ##", "#   #"],
-    "i": ["###", " # ", " # ", " # ", "###"],
-    "n": ["#   #", "##  #", "# # #", "#  ##", "#   #"],
-    "M": ["#   #", "## ##", "# # #", "#   #", "#   #"],
-    "L": ["#    ", "#    ", "#    ", "#    ", "#####"],
-    "C": ["####", "#   ", "#   ", "#   ", "####"],
-    "I": ["###", " # ", " # ", " # ", "###"],
+_BANNER_STYLES = ("capsule", "tiles", "prompt")
+_LETTER_ART = {
+    "W": ("#     #", "#     #", "#     #", "#  #  #", "# # # #", "##   ##", "#     #"),
+    "I": ("#####", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "#####"),
+    "N": ("#     #", "##    #", "# #   #", "#  #  #", "#   # #", "#    ##", "#     #"),
+    "M": ("#     #", "##   ##", "# # # #", "#  #  #", "#     #", "#     #", "#     #"),
+    "L": ("#      ", "#      ", "#      ", "#      ", "#      ", "#      ", "#######"),
 }
-# Two word segments; rendered with a wider gap between them.
-_SEGMENTS: list[list[str]] = [list("WinML"), list("CLI")]
-_LETTER_GAP = "  "  # between letters within a word
-_WORD_GAP = "    "  # between words
+_COMPACT_LETTER_ART = {
+    "W": ("#   #", "#   #", "# # #", "## ##", "#   #"),
+    "I": ("###", " # ", " # ", " # ", "###"),
+    "N": ("#   #", "##  #", "# # #", "#  ##", "#   #"),
+    "M": ("#   #", "## ##", "# # #", "#   #", "#   #"),
+    "L": ("#    ", "#    ", "#    ", "#    ", "#####"),
+}
+_WORDMARK = "WINML"
+_LETTER_GAP = " "
+# Four 4-column gradient tiles arranged as a Microsoft-style 2x2 mark.
+_MARK_ART = (
+    "#### ####",
+    "#### ####",
+    "#### ####",
+    "         ",
+    "#### ####",
+    "#### ####",
+    "#### ####",
+)
 
 # Gradient stops (left → right across the full banner width).
 _GRADIENT: list[tuple[float, tuple[int, int, int]]] = [
-    (0.00, (0, 230, 255)),  # cyan
-    (0.25, (0, 100, 255)),  # blue
-    (0.50, (130, 0, 255)),  # purple
-    (0.75, (255, 0, 180)),  # pink
-    (1.00, (255, 80, 80)),  # red
+    (0.00, (45, 145, 255)),
+    (0.55, (0, 205, 255)),
+    (1.00, (130, 70, 255)),
 ]
 
 
@@ -83,53 +92,209 @@ def _gradient_color(t: float) -> tuple[int, int, int]:
     return _GRADIENT[-1][1]
 
 
-def _print_banner(version: str, *, _console: Console | None = None) -> None:
-    """Print the WinML CLI gradient banner to stderr using Rich."""
-    from rich.console import Console  # lazy import - keeps startup fast
+def _print_banner(
+    version: str,
+    style: str = "capsule",
+    *,
+    _console: Console | None = None,
+) -> None:
+    """Print the selected WinML CLI banner to stderr using Rich."""
+    from rich.console import Console, Group  # lazy import - keeps startup fast
+    from rich.live import Live
     from rich.text import Text
 
-    # Compute total art width across both word segments.
-    art_w = len(_WORD_GAP) * (len(_SEGMENTS) - 1)
-    for seg in _SEGMENTS:
-        art_w += len(_LETTER_GAP) * (len(seg) - 1)
-        art_w += sum(len(_LETTER_ART[ch][0]) for ch in seg)
-    bar_w = art_w + 4
     margin = "  "
-
     con = _console or Console(stderr=True, highlight=False)
-    con.print()
+    art_rows = tuple(
+        _LETTER_GAP.join(_LETTER_ART[letter][row] for letter in _WORDMARK)
+        for row in range(7)
+    )
+    compact_rows = tuple(
+        _LETTER_GAP.join(_COMPACT_LETTER_ART[letter][row] for letter in _WORDMARK)
+        for row in range(5)
+    )
+    art_width = len(art_rows[0]) * 2
+    compact_width = len(compact_rows[0]) * 2
+    mark_width = len(_MARK_ART[0]) * 2
+    show_mark = con.width >= compact_width + mark_width + 11
 
-    for row_idx in range(5):
-        line = Text(margin)
-        col = 0
-        for seg_idx, seg in enumerate(_SEGMENTS):
-            if seg_idx > 0:
-                line.append(_WORD_GAP)
-                col += len(_WORD_GAP)
-            for letter_idx, letter in enumerate(seg):
-                if letter_idx > 0:
-                    line.append(_LETTER_GAP)
-                    col += len(_LETTER_GAP)
-                for ch in _LETTER_ART[letter][row_idx]:
-                    if ch == "#":
-                        r, g, b = _gradient_color(col / max(art_w - 1, 1))
-                        line.append("█", style=f"bold rgb({r},{g},{b})")
-                    else:
-                        line.append(" ")
-                    col += 1
-        con.print(line)
+    def gradient_line(value: str, shimmer_col: int | None = None) -> Text:
+        line = Text()
+        for col, char in enumerate(value):
+            r, g, b = _gradient_color(col / max(len(value) - 1, 1))
+            if shimmer_col is not None:
+                glow = max(0.0, 1.0 - abs(col - shimmer_col) / 5)
+                r, g, b = (
+                    round(r + (255 - r) * glow),
+                    round(g + (255 - g) * glow),
+                    round(b + (255 - b) * glow),
+                )
+            line.append(char, style=f"bold rgb({r},{g},{b})")
+        return line
 
-    con.print()
-    bar = Text(margin)
-    for i in range(bar_w):
-        r, g, b = _gradient_color(i / max(bar_w - 1, 1))
-        bar.append("─", style=f"rgb({r},{g},{b})")
-    con.print(bar)
+    def footer(tagline: str, *, include_version: bool = True) -> list[Text]:
+        lines = [
+            Text(),
+            Text.from_markup(f"{margin}[bold rgb(160,100,255)]Windows ML[/]  ·  {tagline}"),
+        ]
+        if include_version:
+            lines.append(Text.from_markup(f"{margin}[dim]v{version}  ·  CPU · GPU · NPU[/]"))
+        lines.append(Text())
+        return lines
 
-    con.print()
-    con.print(f"{margin}[bold rgb(160,100,255)]Windows ML  ·  Model Conversion & Optimization[/]")
-    con.print(f"{margin}[dim]v{version}  ·  CPU · GPU · NPU[/]")
-    con.print()
+    def wordmark(
+        shimmer_col: int | None = None,
+        visible_col: int | None = None,
+        *,
+        compact: bool = False,
+    ) -> list[Text]:
+        lines = []
+        patterns = compact_rows if compact else art_rows
+        width = compact_width if compact else art_width
+        shadow_rows = (*patterns, " " * len(patterns[0]))
+        for row, pattern in enumerate(shadow_rows):
+            line = Text()
+            previous = shadow_rows[row - 1] if row else ""
+            for pixel_col, char in enumerate(pattern):
+                col = pixel_col * 2
+                visible = visible_col is None or col < visible_col
+                if char == "#" and visible:
+                    r, g, b = _gradient_color(col / max(width - 1, 1))
+                    if shimmer_col is not None:
+                        glow = max(0.0, 1.0 - abs(col - shimmer_col) / 7)
+                        r, g, b = (
+                            round(r + (255 - r) * glow),
+                            round(g + (255 - g) * glow),
+                            round(b + (255 - b) * glow),
+                        )
+                    line.append("██", style=f"bold rgb({r},{g},{b})")
+                elif row and pixel_col and previous[pixel_col - 1] == "#" and visible:
+                    line.append("▓▓", style="bold rgb(95,45,180)")
+                else:
+                    line.append("  ")
+            lines.append(line)
+        return lines
+
+    def mark() -> list[Text]:
+        pane_cols = len(_MARK_ART[0])
+        lines = []
+        for pattern in _MARK_ART:
+            line = Text()
+            for col, char in enumerate(pattern):
+                if char == "#":
+                    r, g, b = _gradient_color(col / max(pane_cols - 1, 1))
+                    line.append("██", style=f"bold rgb({r},{g},{b})")
+                else:
+                    line.append("  ")
+            lines.append(line)
+        return lines
+
+    def capsule(frame: int | None = None) -> Group:
+        logo_lines = wordmark(frame, compact=True)
+        version_text = Text.from_markup(f"[dim]v{version}  ·  CPU · GPU · NPU[/]")
+        version_line = Text(" " * ((compact_width - len(version_text)) // 2))
+        version_line.append_text(version_text)
+        version_line.append(" " * (compact_width - len(version_line)))
+        logo_lines.extend([Text(" " * compact_width), version_line])
+        mark_lines = mark() if show_mark else []
+        content_width = compact_width + (mark_width + 3 if show_mark else 0)
+        frame_margin = margin if show_mark else ""
+
+        def framed_line(content: Text | None = None) -> Text:
+            line = gradient_line(f"{frame_margin}┃  ")
+            if content is None:
+                line.append(" " * content_width)
+            else:
+                line.append_text(content)
+                line.append(" " * (content_width - len(content)))
+            line.append("  ┃", style="bold rgb(130,70,255)")
+            return line
+
+        lines = [
+            Text(),
+            Text.from_markup(f"{margin}[dim]Windows ML CLI[/]"),
+            gradient_line(f"{frame_margin}┏{'━' * (content_width + 4)}┓", frame),
+            framed_line(),
+        ]
+        for row in range(max(len(logo_lines), len(mark_lines))):
+            content = Text()
+            if show_mark:
+                mark_line = mark_lines[row] if row < len(mark_lines) else Text(" " * mark_width)
+                content.append_text(mark_line)
+                content.append("   ")
+            logo_line = logo_lines[row] if row < len(logo_lines) else Text(" " * compact_width)
+            content.append_text(logo_line)
+            lines.append(framed_line(content))
+
+        lines.extend(
+            [
+                framed_line(),
+                gradient_line(f"{frame_margin}┗{'━' * (content_width + 4)}┛", frame),
+                *footer("Model conversion & optimization", include_version=False),
+            ]
+        )
+        return Group(*lines)
+
+    def tiles(frame: int | None = None) -> Group:
+        lit_tiles = 4 if frame is None else frame
+        colors = ("0,230,255", "0,100,255", "130,0,255", "255,0,180")
+
+        def tile(index: int) -> Text:
+            color = colors[index] if index < lit_tiles else "55,55,65"
+            return Text("██", style=f"bold rgb({color})")
+
+        lines = [Text()]
+        for row, logo_line in enumerate(wordmark()):
+            line = Text(margin)
+            if row in (1, 2):
+                indexes = (0, 1)
+            elif row in (5, 6):
+                indexes = (2, 3)
+            else:
+                indexes = None
+            if indexes:
+                line.append_text(tile(indexes[0]))
+                line.append(" ")
+                line.append_text(tile(indexes[1]))
+            else:
+                line.append("     ")
+            line.append("  ")
+            line.append_text(logo_line)
+            lines.append(line)
+        lines.extend(footer("Model conversion & optimization"))
+        return Group(*lines)
+
+    def prompt(frame: int | None = None) -> Group:
+        lines = [Text(), Text(f"{margin}>_", style="bold bright_cyan"), Text()]
+        for logo_line in wordmark(visible_col=frame):
+            line = Text(margin)
+            line.append_text(logo_line)
+            lines.append(line)
+        lines.extend(footer("Build · Optimize · Deploy"))
+        return Group(*lines)
+
+    if style == "capsule":
+        render = capsule
+        frames = range(-4, art_width + 5, 4)
+        delay = 0.02
+    elif style == "tiles":
+        render = tiles
+        frames = range(5)
+        delay = 0.07
+    elif style == "prompt":
+        render = prompt
+        frames = range(0, art_width + 5, 4)
+        delay = 0.02
+    else:
+        raise ValueError(f"Unknown banner style: {style}")
+
+    if con.is_terminal and con.color_system is not None and con.width >= art_width + 6:
+        with Live(render(frames[0]), console=con, auto_refresh=False, transient=True) as live:
+            for frame in frames[1:]:
+                live.update(render(frame), refresh=True)
+                sleep(delay)
+
+    con.print(render())
 
 
 # Commands that are temporarily disabled from the CLI surface.
@@ -284,7 +449,7 @@ class LazyGroup(ActionGroup):
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         """Emit banner to stderr, then delegate to normal help formatting."""
-        _print_banner(__version__)
+        _print_banner(__version__, ctx.params.get("banner_style", "capsule"))
         super().format_help(ctx, formatter)
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
@@ -314,6 +479,14 @@ class LazyGroup(ActionGroup):
 @verbosity_options()
 @no_color_option()
 @click.option(
+    "--banner-style",
+    type=click.Choice(_BANNER_STYLES),
+    default="capsule",
+    show_default=True,
+    is_eager=True,
+    help="Choose the top-level help banner style.",
+)
+@click.option(
     "--debug",
     is_flag=True,
     default=False,
@@ -321,7 +494,13 @@ class LazyGroup(ActionGroup):
     hidden=True,
 )
 @click.pass_context
-def main(ctx: click.Context, verbose: int, quiet: bool, debug: bool) -> None:
+def main(
+    ctx: click.Context,
+    verbose: int,
+    quiet: bool,
+    banner_style: str,
+    debug: bool,
+) -> None:
     """WinML CLI - Accelerate Model Deployment on WinML.
 
     Universal ONNX export with various WinML execution providers support.
