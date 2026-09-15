@@ -1796,8 +1796,7 @@ class TestBuildPipelineStageControls:
 
     @staticmethod
     def _write_model(path: Path, graph_kind: str) -> None:
-        import onnx
-        from onnx import TensorProto, helper
+        from onnx import TensorProto, checker, helper, save
 
         input_type = output_type = TensorProto.FLOAT
         initializers = []
@@ -1826,8 +1825,8 @@ class TestBuildPipelineStageControls:
             initializer=initializers,
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-        onnx.checker.check_model(model)
-        onnx.save(model, path)
+        checker.check_model(model)
+        save(model, path)
 
     @staticmethod
     def _config(input_kind: str, quant_mode: str, config_skip: bool = False) -> dict:
