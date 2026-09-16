@@ -169,7 +169,7 @@ def _print_banner(
                         )
                     line.append("██", style=f"bold rgb({r},{g},{b})")
                 elif row and pixel_col and previous[pixel_col - 1] == "#" and visible:
-                    line.append("▓▓", style="bold rgb(95,45,180)")
+                    line.append("▓▓", style="bold rgb(130,80,210)")
                 else:
                     line.append("  ")
             lines.append(line)
