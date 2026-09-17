@@ -5,9 +5,9 @@ description: 'Use when optimizing ONNX latency with WinML for a target EP/device
 
 Resolve model, EP/device, goal, workdir, and `WINML_CLI_REPO`; ask for missing values. Hash model, inputs, env, versions, and options. Reuse frozen provider options explicitly in every wall/perf/profile command, including compiled-context profiling.
 
-Inspect CLI help; never invent flags. Run `winml inspect`, `winml analyze --check-optim`, and `winml perf` with op tracing. Collect hotspots, partitions, fallback, layout, and transfers. Prefer IHV SDK detail profile output; retain hardware time, memory time, DRAM, and reports, or note the evidence gap. Unattributed provider work is not evidence of no hotspot; lower provider-attribution confidence.
+Inspect CLI help. Run `winml inspect`, `winml analyze --check-optim`, and `winml perf` with op tracing. Collect hotspots, partitions, fallback, layout, transfers. Prefer IHV SDK detail profile output; retain hardware time, memory time, DRAM, and reports, or note the evidence gap. Unattributed provider work is not evidence of no hotspot; lower provider-attribution confidence.
 
-Write an evidence brief on bottlenecks, provider work, gaps before forming hypotheses.
+Resume at the [first unverified gate](./references/resume.md): validate supplied candidates; plan only new experiments. Write an evidence brief on bottlenecks, provider work, gaps before hypotheses.
 
 ## Planning router - evaluate before loading cases or proposing hypotheses
 
@@ -45,7 +45,7 @@ Run [`render_report.py`](./scripts/render_report.py). Run full replay from a fre
 
 After bundle validation, run `promotion.py create` once for `promotion_handoff.json`; follow [PR Routing](./references/pr-routing.md). Auto-optimize owns the optimizer PR. Run `gh label list`; the target repo must contain `model-opt-by-skill`, and the skill must not create the label automatically. Create the Draft PR with `gh pr create --draft --label model-opt-by-skill`, then verify with `gh pr view <url> --json labels`. Missing or unavailable label blocks handoff, and missing post-create label verification blocks handoff. Use [Ponytail](./references/ponytail.md) or fallback, then invoke [Check-in Reviewer](./roles/checkin-reviewer.md), record its ready for check-in verdict; never merge or convert the Draft.
 
-Bundled knowledge is model-agnostic. Model identities, paths, node/tensor names, builds, commands, and artifacts stay run-local.
+Bundled knowledge is model-agnostic. Artifacts stay run-local.
 
 Persist reusable tested outcomes. Run [`save_case.py`](./scripts/save_case.py) so the case and SHA-256-bound index are atomic. Before writing, Graph Scout must return `GENERIC_CASE_APPROVED` for the `--content-digest` digest and bind it in `generic_review`; otherwise keep it run-local.
 
