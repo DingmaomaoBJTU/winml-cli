@@ -5,7 +5,7 @@
 """CLI surface tests for ``winml`` (no args) and ``winml --help``.
 
 Both invocations follow the same contract: exit 0 and render the full
-help page, which consists of the gradient banner on stderr and the Click
+help page, which consists of the selected banner on stderr and the Click
 help text (Usage / Options / Commands) on stdout.  The tests here pin the
 *observable output contract* of these two entry points — no mocks, no
 subcommand execution.
@@ -35,16 +35,20 @@ These tests run under the default CI filter (no special marker required).
 from __future__ import annotations
 
 import textwrap
+from io import StringIO
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner, Result
+from rich.console import Console
 
 from winml.modelkit import __version__
 from winml.modelkit.cli import (
     _COMMANDS_DIR,
     _DISABLED_COMMANDS,
     _parse_click_help,
+    _print_banner,
     main,
 )
 
@@ -145,6 +149,72 @@ class TestWinmlHelp:
         result = _invoke("sys", "--help")
         assert result.exit_code == 0
         assert "Windows ML" not in result.stderr
+
+    @pytest.mark.parametrize(
+        ("style", "marker"),
+        [
+            ("capsule", "┏"),
+            ("tiles", "██ ██"),
+            ("prompt", ">_"),
+        ],
+    )
+    def test_banner_style_can_be_selected(self, style: str, marker: str) -> None:
+        result = _invoke("--banner-style", style, "--help")
+        assert result.exit_code == 0
+        assert marker in result.stderr
+
+    def test_banner_animation_is_skipped_outside_interactive_terminals(self) -> None:
+        with patch("winml.modelkit.cli.sleep") as mock_sleep:
+            _print_banner(
+                "1.2.3",
+                _console=Console(
+                    file=StringIO(),
+                    force_terminal=False,
+                    color_system=None,
+                ),
+            )
+            mock_sleep.assert_not_called()
+
+    @pytest.mark.parametrize("style", ["capsule", "tiles", "prompt"])
+    def test_each_banner_style_animates_in_interactive_terminals(self, style: str) -> None:
+        with patch("winml.modelkit.cli.sleep") as mock_sleep:
+            _print_banner(
+                "1.2.3",
+                style,
+                _console=Console(
+                    file=StringIO(),
+                    force_terminal=True,
+                    color_system="truecolor",
+                    width=100,
+                ),
+            )
+            assert mock_sleep.call_count > 1
+
+    def test_unknown_banner_style_is_rejected(self) -> None:
+        result = _invoke("--banner-style", "unknown", "--help")
+        assert result.exit_code != 0
+        assert "Invalid value for '--banner-style'" in result.output
+
+    # Each row contains two four-column gradient tiles separated by a gap.
+    _MARK_SIGNATURE = "████████  ████████"
+
+    def test_capsule_shows_left_mark_on_wide_terminals(self) -> None:
+        console = Console(file=StringIO(), force_terminal=False, color_system=None, width=90)
+        _print_banner("1.2.3", "capsule", _console=console)
+        assert self._MARK_SIGNATURE in console.file.getvalue()
+
+    def test_capsule_hides_left_mark_on_narrow_terminals(self) -> None:
+        console = Console(file=StringIO(), force_terminal=False, color_system=None, width=80)
+        _print_banner("1.2.3", "capsule", _console=console)
+        assert self._MARK_SIGNATURE not in console.file.getvalue()
+
+    def test_capsule_places_version_inside_frame(self) -> None:
+        console = Console(file=StringIO(), force_terminal=False, color_system=None, width=110)
+        _print_banner("1.2.3", "capsule", _console=console)
+        output = console.file.getvalue()
+        version_line = next(line for line in output.splitlines() if "v1.2.3" in line)
+        assert version_line.strip().startswith("┃")
+        assert version_line.strip().endswith("┃")
 
 
 # ===========================================================================
@@ -322,7 +392,7 @@ class TestOptionsSection:
 
     @pytest.mark.parametrize(
         "opt",
-        ["--version", "--verbose", "-v", "--quiet", "-q", "--help", "-h"],
+        ["--version", "--verbose", "-v", "--quiet", "-q", "--banner-style", "--help", "-h"],
     )
     def test_option_present(self, opt: str) -> None:
         assert opt in _invoke("--help").output
