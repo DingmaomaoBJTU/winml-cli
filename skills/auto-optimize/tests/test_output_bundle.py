@@ -843,6 +843,65 @@ def test_repro_script_preserves_quoted_assignment_relative_path_with_spaces(
 
 
 @pytest.mark.parametrize(
+    "script_argument",
+    [
+        "--model=`/opt/Private` Dir/model.onnx",
+        r"--model=`\`\server`\Private` Dir`\model.onnx",
+    ],
+)
+def test_repro_script_rejects_backtick_escaped_absolute_paths(
+    output_module: ModuleType,
+    tmp_path: Path,
+    script_argument: str,
+) -> None:
+    report, champion, config, companion = _inputs(tmp_path)
+    rebuild_config, repro_script, repro_lock, assets = _repro_inputs(tmp_path)
+    repro_script.write_text(
+        VALID_REPRO_RUN_BODY + f"winml build {script_argument}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(output_module.OutputBundleError, match="absolute"):
+        output_module.finalize_output(
+            report,
+            champion,
+            config,
+            [companion],
+            tmp_path / "output",
+            rebuild_config=rebuild_config,
+            repro_script=repro_script,
+            repro_lock=repro_lock,
+            repro_assets=assets,
+        )
+
+
+def test_repro_script_preserves_backtick_escaped_relative_path_bytes(
+    output_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    report, champion, config, companion = _inputs(tmp_path)
+    rebuild_config, repro_script, repro_lock, assets = _repro_inputs(tmp_path)
+    script_text = VALID_REPRO_RUN_BODY + "winml build --model=models/Private` Dir/model.onnx\n"
+    script_bytes = script_text.encode("utf-8")
+    repro_script.write_bytes(script_bytes)
+    output = tmp_path / "output"
+
+    output_module.finalize_output(
+        report,
+        champion,
+        config,
+        [companion],
+        output,
+        rebuild_config=rebuild_config,
+        repro_script=repro_script,
+        repro_lock=repro_lock,
+        repro_assets=assets,
+    )
+
+    assert (output / "repro-run.ps1").read_bytes() == script_bytes
+
+
+@pytest.mark.parametrize(
     ("mutate", "match"),
     [
         (lambda lock: lock.pop("source"), "source"),

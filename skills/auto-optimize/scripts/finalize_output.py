@@ -389,6 +389,33 @@ def _strip_token_quotes(value: str) -> str:
     return value
 
 
+def _decode_token_value(value: str) -> str:
+    decoded: list[str] = []
+    active_quote: str | None = None
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "`" and active_quote != "'":
+            index += 1
+            if index < len(value):
+                decoded.append(value[index])
+        elif active_quote is not None:
+            if character == active_quote:
+                if index + 1 < len(value) and value[index + 1] == active_quote:
+                    decoded.append(character)
+                    index += 1
+                else:
+                    active_quote = None
+            else:
+                decoded.append(character)
+        elif character in {'"', "'"}:
+            active_quote = character
+        else:
+            decoded.append(character)
+        index += 1
+    return "".join(decoded)
+
+
 def _assignment_values(token: str) -> list[str]:
     values: list[str] = []
     for index, character in enumerate(token):
@@ -433,8 +460,8 @@ def _contains_absolute_script_path(text: str) -> bool:
         if line.lstrip().startswith("#"):
             continue
         previous_token: str | None = None
-        for token in _script_tokens(line):
-            token = _strip_token_quotes(token)
+        for raw_token in _script_tokens(line):
+            token = _decode_token_value(raw_token)
             if _is_absolute_script_path(token, previous_token=previous_token):
                 return True
             if any(
