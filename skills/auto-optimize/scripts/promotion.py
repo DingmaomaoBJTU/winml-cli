@@ -25,6 +25,8 @@ from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from types import ModuleType
+else:
+    ModuleType = type(sys)
 
 
 HANDOFF_SCHEMA = "model-support-promotion-v1"

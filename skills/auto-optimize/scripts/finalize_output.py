@@ -22,6 +22,9 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from types import ModuleType
+else:
+    Sequence = importlib.import_module("collections.abc").Sequence
+    ModuleType = type(sys)
 
 
 RESERVED_NAMES = {
