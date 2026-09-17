@@ -143,7 +143,7 @@ def prepare(case: dict, workdir: Path) -> None:
     (workdir / "decision-schema.json").write_text(json.dumps(schema), encoding="utf-8")
 
 
-def run_case(case: dict, output: Path, codex: str, timeout: int) -> dict:
+def run_case(case: dict, output: Path, codex: str, timeout: int, python: str | None = None) -> dict:
     """Launch a fresh workspace-write agent with no network or external writes requested."""
     workdir = output / case["id"]
     prepare(case, workdir)
@@ -151,7 +151,7 @@ def run_case(case: dict, output: Path, codex: str, timeout: int) -> dict:
         "This is a bounded offline behavioral eval of auto-optimize. Read skill/SKILL.md "
         "and relevant references, "
         "then act on the scenario using tools. The only permitted workflow actions are via "
-        + getattr(sys, "_base_executable", sys.executable)
+        + Path(python or getattr(sys, "_base_executable", sys.executable)).as_posix()
         + " harness.py ACTION. Actions: plan, probe-representation, probe-qdq-boundary, "
         "normal-probe, correctness, performance, arbiter, replay, publish, "
         "validate-bundle, promotion. "
@@ -258,9 +258,12 @@ def main() -> int:
     )
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--codex", default=shutil.which("codex"))
+    parser.add_argument("--python", type=Path, help="Sandbox-accessible Python for fixture actions")
     args = parser.parse_args()
     if not args.codex:
         parser.error("Install/authenticate Codex CLI first")
+    if args.python and not args.python.is_file():
+        parser.error("--python must name an existing Python executable")
     scenarios = json.loads((ROOT / "scenarios.json").read_text())["scenarios"]
     if args.case:
         unknown = set(args.case) - {case["id"] for case in scenarios}
@@ -272,7 +275,15 @@ def main() -> int:
     results = []
     for case in scenarios:
         print("Running " + case["id"], flush=True)
-        results.append(run_case(case, output, args.codex, args.timeout))
+        results.append(
+            run_case(
+                case,
+                output,
+                args.codex,
+                args.timeout,
+                str(args.python.resolve()) if args.python else None,
+            )
+        )
         (output / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
         print(case["id"] + ": " + results[-1]["status"], flush=True)
     return 0 if all(result["status"] == "PASS" for result in results) else 1

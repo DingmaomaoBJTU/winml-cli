@@ -34,3 +34,22 @@ There is no automatic live-agent CI job. Deterministic evaluator tests run with
 the existing skill tests. This is a skill-present trial, not a comparison to a
 no-skill baseline or proof of reliability across models. Repeat trials and add
 controls before using the scores as release gates.
+
+## Windows Python execution denied
+
+The Windows sandbox can read the scenario but fail to launch a user-private
+Python installation whose ACL permits only the owning account. Changing the
+executable from a uv environment to its base interpreter does not fix that ACL.
+Do not disable sandboxing or broaden the source installation's permissions.
+
+Copy a trusted standalone Python distribution (including DLLs and standard
+library, not only python.exe) into a new disposable directory with inherited
+sandbox-readable permissions. Test python.exe --version from a workspace-write
+Codex session first. Then select it explicitly:
+
+    python skills/auto-optimize/evals/run_evals.py --python <copied-python.exe> --output <new-directory>
+
+The runner itself can use the original interpreter. The simulator only needs
+the standard library. Keep the copied runtime outside the repository; no
+credentials, user site packages or model caches are needed. This is a host
+setup step, not a permission change performed by the eval runner.
