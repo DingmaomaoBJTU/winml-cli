@@ -10,6 +10,7 @@ import importlib.util
 import inspect
 import sys
 import types
+from collections.abc import Sequence
 from pathlib import Path
 from typing import get_type_hints
 
@@ -51,6 +52,14 @@ def test_finalize_output_module_annotations_resolve_at_runtime() -> None:
     }
 
     assert not failures, failures
+    assert get_type_hints(module._load_renderer)["return"] is types.ModuleType
+    expected_sequence = Sequence[Path]
+    assert get_type_hints(module._prepare_inputs)["companions"] == expected_sequence
+    assert get_type_hints(module._prepare_reproduction)["repro_assets"] == expected_sequence
+    assert get_type_hints(module._prepare_reproduction)["companions"] == expected_sequence
+    assert get_type_hints(module._validate_repro_lock)["assets"] == expected_sequence
+    assert get_type_hints(module.finalize_output)["companions"] == expected_sequence
+    assert get_type_hints(module.finalize_output)["repro_assets"] == expected_sequence
 
 
 def test_cached_promotion_finalizer_annotation_resolves_at_runtime() -> None:

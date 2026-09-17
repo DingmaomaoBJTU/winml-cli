@@ -157,6 +157,23 @@ def test_invalid_evidence_raises_hotspot_plan_error(evidence: dict[str, Any]) ->
         module.plan_hotspot(evidence)
 
 
+@pytest.mark.parametrize(
+    "percentage",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+def test_non_finite_percentage_raises_hotspot_plan_error(percentage: float) -> None:
+    module = _load_module()
+    evidence = _base_evidence()
+    evidence["dominant_accelerator_time_pct"] = percentage
+
+    with pytest.raises(
+        module.HotspotPlanError,
+        match=r"dominant_accelerator_time_pct must be a number in \[0, 100\]",
+    ):
+        module.plan_hotspot(evidence)
+
+
 def test_cli_stdout_and_output_are_byte_stable(tmp_path: Path) -> None:
     input_path = tmp_path / "hotspot_evidence.json"
     output_path = tmp_path / "hotspot_plan.json"
@@ -238,3 +255,29 @@ def test_cli_prints_error_and_exits_one_for_invalid_evidence(tmp_path: Path) -> 
     assert result.returncode == 1
     assert result.stdout == ""
     assert result.stderr.startswith("ERROR: ")
+
+
+def test_cli_prints_error_and_exits_one_for_nan_percentage(tmp_path: Path) -> None:
+    input_path = tmp_path / "hotspot_evidence.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                **_base_evidence(),
+                "dominant_accelerator_time_pct": float("nan"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    command = [sys.executable, str(SCRIPT_PATH), str(input_path)]
+    run_process = subprocess.run
+    result = run_process(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == ("ERROR: dominant_accelerator_time_pct must be a number in [0, 100]\n")

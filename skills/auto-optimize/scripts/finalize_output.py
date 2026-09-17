@@ -69,7 +69,6 @@ DELIVERABLE_STATUSES = {
 PASSING_CORRECTNESS = {"pass", "passed"}
 HEX40 = re.compile(r"\A[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
-SCRIPT_TOKEN = re.compile(r"\"([^\"]*)\"|'([^']*)'|(\S+)")
 ALLOWED_SLASH_SWITCHES = {"/c", "/noprofile"}
 SLASH_SWITCH_COMMANDS = {
     "/c": {"cmd", "cmd.exe"},
@@ -351,11 +350,36 @@ def _validate_repro_lock(lock: Any, assets: Sequence[Path]) -> list[str]:
 
 def _script_tokens(text: str) -> list[str]:
     tokens: list[str] = []
-    for match in SCRIPT_TOKEN.finditer(text):
-        for group in match.groups():
-            if group is not None:
-                tokens.append(group)
-                break
+    token: list[str] = []
+    active_quote: str | None = None
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "`" and active_quote != "'":
+            token.append(character)
+            index += 1
+            if index < len(text):
+                token.append(text[index])
+        elif active_quote is not None:
+            token.append(character)
+            if character == active_quote:
+                if index + 1 < len(text) and text[index + 1] == active_quote:
+                    index += 1
+                    token.append(text[index])
+                else:
+                    active_quote = None
+        elif character in {'"', "'"}:
+            active_quote = character
+            token.append(character)
+        elif character.isspace():
+            if token:
+                tokens.append("".join(token))
+                token = []
+        else:
+            token.append(character)
+        index += 1
+    if token:
+        tokens.append("".join(token))
     return tokens
 
 

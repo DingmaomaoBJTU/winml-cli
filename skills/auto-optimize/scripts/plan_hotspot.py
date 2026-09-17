@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,7 @@ def _require_percentage(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise HotspotPlanError("dominant_accelerator_time_pct must be a number in [0, 100]")
     percentage = float(value)
-    if percentage < 0 or percentage > 100:
+    if not math.isfinite(percentage) or percentage < 0 or percentage > 100:
         raise HotspotPlanError("dominant_accelerator_time_pct must be a number in [0, 100]")
     return percentage
 

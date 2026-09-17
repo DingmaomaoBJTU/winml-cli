@@ -785,6 +785,64 @@ def test_repro_script_rejects_assignment_form_absolute_paths(
 
 
 @pytest.mark.parametrize(
+    "script_text",
+    [
+        "$PSScriptRoot\nwinml build --model='C:\\Private Dir\\model.onnx'\n",
+        "$PSScriptRoot\nwinml build --model='/opt/Private Dir/model.onnx'\n",
+        "$PSScriptRoot\n$Model='/opt/Private Dir/model.onnx'\n",
+        "$PSScriptRoot\nwinml build --model='\\\\server\\Private Dir\\model.onnx'\n",
+    ],
+)
+def test_repro_script_rejects_quoted_assignment_absolute_paths_with_spaces(
+    output_module: ModuleType,
+    tmp_path: Path,
+    script_text: str,
+) -> None:
+    report, champion, config, companion = _inputs(tmp_path)
+    rebuild_config, repro_script, repro_lock, assets = _repro_inputs(tmp_path)
+    repro_script.write_text(script_text, encoding="utf-8")
+
+    with pytest.raises(output_module.OutputBundleError, match="absolute"):
+        output_module.finalize_output(
+            report,
+            champion,
+            config,
+            [companion],
+            tmp_path / "output",
+            rebuild_config=rebuild_config,
+            repro_script=repro_script,
+            repro_lock=repro_lock,
+            repro_assets=assets,
+        )
+
+
+def test_repro_script_preserves_quoted_assignment_relative_path_with_spaces(
+    output_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    report, champion, config, companion = _inputs(tmp_path)
+    rebuild_config, repro_script, repro_lock, assets = _repro_inputs(tmp_path)
+    script_text = "$Root = $PSScriptRoot\nwinml build --model='models/Private Dir/model.onnx'\n"
+    script_bytes = script_text.encode("utf-8")
+    repro_script.write_bytes(script_bytes)
+    output = tmp_path / "output"
+
+    output_module.finalize_output(
+        report,
+        champion,
+        config,
+        [companion],
+        output,
+        rebuild_config=rebuild_config,
+        repro_script=repro_script,
+        repro_lock=repro_lock,
+        repro_assets=assets,
+    )
+
+    assert (output / "repro-run.ps1").read_bytes() == script_bytes
+
+
+@pytest.mark.parametrize(
     ("mutate", "match"),
     [
         (lambda lock: lock.pop("source"), "source"),
