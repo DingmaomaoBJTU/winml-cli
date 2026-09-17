@@ -119,17 +119,13 @@ def test_skill_is_small_and_single_agent() -> None:
         assert forbidden not in lowered, forbidden
 
 
-def test_auto_optimize_replaces_retired_auto_config_skill() -> None:
-    copilot_skills_root = SKILL_ROOT.parents[1]
-    readme = (copilot_skills_root / "README.md").read_text(encoding="utf-8")
+def test_auto_optimize_is_checked_in_as_a_repository_skill() -> None:
+    skills_root = SKILL_ROOT.parent
+    repository_root = skills_root.parent
 
-    assert not (copilot_skills_root / "user_skill" / "auto-config").exists()
-    assert "`auto-config/`" not in readme
-    assert "user_skill/auto-config" not in readme
-    assert (
-        "| `auto-optimize` | Run correctness-gated ONNX optimization experiments. |"
-        in readme
-    )
+    assert skills_root.name == "skills"
+    assert (repository_root / "pyproject.toml").is_file()
+    assert not (skills_root / "auto-config").exists()
 
 
 def test_hypotheses_require_winml_evidence_first() -> None:
