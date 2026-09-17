@@ -11,15 +11,18 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import os
 import re
 import shutil
 import sys
 import uuid
-from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
-from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from types import ModuleType
+
 
 RESERVED_NAMES = {
     "champion.onnx",
@@ -70,7 +73,8 @@ SLASH_SWITCH_COMMANDS = {
     "/noprofile": {"pwsh", "pwsh.exe", "powershell", "powershell.exe"},
 }
 
-REPRO_WRAPPER_TEXT = """param([switch]$ValidateOnly)
+REPRO_WRAPPER_TEXT = (
+    """param([switch]$ValidateOnly)
 $ErrorActionPreference = 'Stop'
 
 function Read-BundleJson($RelativePath) {
@@ -90,8 +94,12 @@ if ($null -eq $Lock) {
 
 foreach ($File in $Manifest.files) {
     $RelativePath = [string]$File.path
-    if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.Contains('\\') -or $RelativePath.Contains(':') -or $RelativePath.Contains('..') -or [System.IO.Path]::IsPathRooted($RelativePath)) {
-        throw "Unsafe manifest path: $RelativePath"
+"""
+    "    if ([string]::IsNullOrWhiteSpace($RelativePath) "
+    "-or $RelativePath.Contains('\\') -or $RelativePath.Contains(':') "
+    "-or $RelativePath.Contains('..') "
+    "-or [System.IO.Path]::IsPathRooted($RelativePath)) {\n"
+    """        throw "Unsafe manifest path: $RelativePath"
     }
     $Path = Join-Path $PSScriptRoot $RelativePath
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -115,6 +123,7 @@ if ($ValidateOnly) {
 & (Join-Path $PSScriptRoot 'repro-run.ps1')
 exit $LASTEXITCODE
 """
+)
 
 
 class OutputBundleError(ValueError):
@@ -218,16 +227,12 @@ def _prepare_inputs(
     except renderer.ReportError as error:
         raise OutputBundleError(str(error)) from error
 
-    resolved_companions = [
-        _require_file(Path(path), "champion companion") for path in companions
-    ]
+    resolved_companions = [_require_file(Path(path), "champion companion") for path in companions]
     names: set[str] = set()
     for companion in resolved_companions:
         folded = companion.name.casefold()
         if folded in {name.casefold() for name in RESERVED_NAMES}:
-            raise OutputBundleError(
-                f"companion uses a reserved output name: {companion.name}"
-            )
+            raise OutputBundleError(f"companion uses a reserved output name: {companion.name}")
         if folded in names:
             raise OutputBundleError(f"duplicate companion name: {companion.name}")
         names.add(folded)
@@ -281,9 +286,7 @@ def _validate_repro_lock(lock: Any, assets: Sequence[Path]) -> list[str]:
     if status == "requires-unmerged-pr":
         dependencies = lock.get("dependencies")
         if not isinstance(dependencies, list) or not dependencies:
-            raise OutputBundleError(
-                "requires-unmerged-pr reproduction lock needs dependencies"
-            )
+            raise OutputBundleError("requires-unmerged-pr reproduction lock needs dependencies")
         for dependency in dependencies:
             dependency = _require_object(dependency, "dependency")
             _require_nonempty_string(dependency.get("url"), "dependency.url")
@@ -293,9 +296,7 @@ def _validate_repro_lock(lock: Any, assets: Sequence[Path]) -> list[str]:
     for field in ("kind", "id"):
         _require_nonempty_string(source.get(field), f"source.{field}")
     _require_hex(source.get("revision"), "source.revision", HEX40)
-    _require_hex(
-        source.get("prepared_model_sha256"), "source.prepared_model_sha256", HEX64
-    )
+    _require_hex(source.get("prepared_model_sha256"), "source.prepared_model_sha256", HEX64)
 
     toolchain = _require_object(lock.get("toolchain"), "toolchain")
     winml = _require_object(toolchain.get("winml"), "toolchain.winml")
@@ -308,9 +309,7 @@ def _validate_repro_lock(lock: Any, assets: Sequence[Path]) -> list[str]:
     expected = _require_object(lock.get("expected"), "expected")
     for field in ("public_io", "correctness", "topology", "performance"):
         if not isinstance(expected.get(field), dict) or not expected[field]:
-            raise OutputBundleError(
-                f"reproduction lock expected.{field} must be non-empty"
-            )
+            raise OutputBundleError(f"reproduction lock expected.{field} must be non-empty")
     replay = _require_object(lock.get("replay_validation"), "replay_validation")
     if replay != {"status": "pass", "clean_directory": True}:
         raise OutputBundleError(
@@ -328,9 +327,7 @@ def _validate_repro_lock(lock: Any, assets: Sequence[Path]) -> list[str]:
         item = _require_object(item, "input")
         name = item.get("path")
         if not _safe_basename(name):
-            raise OutputBundleError(
-                "reproduction lock input path must be a safe POSIX basename"
-            )
+            raise OutputBundleError("reproduction lock input path must be a safe POSIX basename")
         folded = str(name).casefold()
         if folded in folded_input_names:
             raise OutputBundleError(f"duplicate reproduction input basename: {name}")
@@ -369,10 +366,7 @@ def _assignment_values(token: str) -> list[str]:
     values: list[str] = []
     for index, character in enumerate(token):
         is_drive_colon = (
-            index == 1
-            and token[0].isalpha()
-            and len(token) > 2
-            and token[2] in {"\\", "/"}
+            index == 1 and token[0].isalpha() and len(token) > 2 and token[2] in {"\\", "/"}
         )
         if character == "=" or (character == ":" and not is_drive_colon):
             values.append(_strip_token_quotes(token[index + 1 :]))
@@ -432,15 +426,11 @@ def _validate_repro_script(path: Path) -> None:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as error:
-        raise OutputBundleError(
-            "reproduction script must be UTF-8 decodable"
-        ) from error
+        raise OutputBundleError("reproduction script must be UTF-8 decodable") from error
     if "$PSScriptRoot" not in text:
         raise OutputBundleError("reproduction script must use $PSScriptRoot")
     if _contains_absolute_script_path(text):
-        raise OutputBundleError(
-            "reproduction script must not contain absolute filesystem paths"
-        )
+        raise OutputBundleError("reproduction script must not contain absolute filesystem paths")
 
 
 def _repro_wrapper_bytes() -> bytes:
@@ -457,14 +447,10 @@ def _prepare_reproduction(
     primary = [rebuild_config, repro_script, repro_lock]
     if not any(primary):
         if repro_assets:
-            raise OutputBundleError(
-                "reproduction assets require the primary reproduction trio"
-            )
+            raise OutputBundleError("reproduction assets require the primary reproduction trio")
         return None
     if not all(primary):
-        raise OutputBundleError(
-            "reproduction requires rebuild config, script, and lock together"
-        )
+        raise OutputBundleError("reproduction requires rebuild config, script, and lock together")
 
     assert rebuild_config is not None
     assert repro_script is not None
@@ -472,9 +458,7 @@ def _prepare_reproduction(
     rebuild_config = _require_file(Path(rebuild_config), "rebuild config")
     repro_script = _require_file(Path(repro_script), "reproduction script")
     repro_lock = _require_file(Path(repro_lock), "reproduction lock")
-    resolved_assets = [
-        _require_file(Path(path), "reproduction asset") for path in repro_assets
-    ]
+    resolved_assets = [_require_file(Path(path), "reproduction asset") for path in repro_assets]
 
     _validate_rebuild_config(rebuild_config)
     _validate_repro_script(repro_script)
@@ -496,9 +480,7 @@ def _prepare_reproduction(
             raise OutputBundleError(f"reproduction name collision: {asset.name}")
         names[folded] = asset.name
 
-    asset_names = _validate_repro_lock(
-        _load_json(repro_lock, "reproduction lock"), resolved_assets
-    )
+    asset_names = _validate_repro_lock(_load_json(repro_lock, "reproduction lock"), resolved_assets)
     reproduction = {
         "script": "repro.ps1",
         "run_script": "repro-run.ps1",
@@ -523,9 +505,9 @@ def _publish_directory(stage: Path, output: Path, *, overwrite: bool) -> None:
     moved_old = False
     try:
         if output.exists():
-            os.replace(output, backup)
+            output.replace(backup)
             moved_old = True
-        os.replace(stage, output)
+        stage.replace(output)
         if moved_old:
             if backup.is_dir():
                 shutil.rmtree(backup)
@@ -533,7 +515,7 @@ def _publish_directory(stage: Path, output: Path, *, overwrite: bool) -> None:
                 backup.unlink()
     except Exception:
         if not output.exists() and moved_old and backup.exists():
-            os.replace(backup, output)
+            backup.replace(output)
         raise
     finally:
         if stage.exists():
@@ -597,9 +579,7 @@ def finalize_output(
         facts["leader"]["model_path"] = "champion.onnx"
         facts["artifacts"] = {
             "champion_onnx": "champion.onnx",
-            "companions": [
-                {"path": path.name, "role": "companion"} for path in companion_sources
-            ],
+            "companions": [{"path": path.name, "role": "companion"} for path in companion_sources],
             "winml_config": "winml_config.json",
             "manifest": "manifest.json",
         }
@@ -618,17 +598,13 @@ def finalize_output(
             "report.html": "generated:report.json",
         }
         sources.update({path.name: str(path) for path in companion_sources})
-        sources.update(
-            {name: "generated:reproduction_wrapper" for name in generated_sources}
-        )
+        sources.update(dict.fromkeys(generated_sources, "generated:reproduction_wrapper"))
         sources.update({name: str(path) for name, path in reproduction_sources.items()})
         roles = dict(REQUIRED_ROLES)
         roles.update({path.name: "companion" for path in companion_sources})
         roles.update(REPRODUCTION_ROLES)
         if reproduction is not None:
-            roles.update(
-                {name: "reproduction_asset" for name in reproduction["assets"]}
-            )
+            roles.update(dict.fromkeys(reproduction["assets"], "reproduction_asset"))
         paths = sorted(
             (path for path in stage.iterdir() if path.name != "manifest.json"),
             key=lambda path: path.name.casefold(),
@@ -640,9 +616,7 @@ def finalize_output(
             "winml_config": "winml_config.json",
             "report_json": "report.json",
             "report_html": "report.html",
-            "files": [
-                _entry(path, roles[path.name], sources[path.name]) for path in paths
-            ],
+            "files": [_entry(path, roles[path.name], sources[path.name]) for path in paths],
         }
         if reproduction is not None:
             manifest["reproduction"] = reproduction
@@ -676,21 +650,13 @@ def validate_output_bundle(output_dir: Path) -> dict[str, Any]:
         for entry in files
         if isinstance(entry, dict) and isinstance(entry.get("path"), str)
     }
-    actual = {
-        path.relative_to(output).as_posix()
-        for path in output.rglob("*")
-        if path.is_file()
-    }
+    actual = {path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()}
     untracked = sorted(actual - declared - {"manifest.json"})
     if untracked:
-        raise OutputBundleError(
-            f"bundle contains untracked files: {', '.join(untracked)}"
-        )
+        raise OutputBundleError(f"bundle contains untracked files: {', '.join(untracked)}")
     missing_declared = sorted(declared - actual)
     if missing_declared:
-        raise OutputBundleError(
-            f"bundle is missing declared files: {', '.join(missing_declared)}"
-        )
+        raise OutputBundleError(f"bundle is missing declared files: {', '.join(missing_declared)}")
 
     entries: dict[str, dict[str, Any]] = {}
     for entry in files:
@@ -739,13 +705,9 @@ def validate_output_bundle(output_dir: Path) -> dict[str, Any]:
                 )
         assets = reproduction.get("assets")
         if not isinstance(assets, list):
-            raise OutputBundleError(
-                "bundle manifest reproduction assets must be a list"
-            )
+            raise OutputBundleError("bundle manifest reproduction assets must be a list")
         if assets != sorted(assets, key=str.casefold):
-            raise OutputBundleError(
-                "bundle manifest reproduction assets must be sorted"
-            )
+            raise OutputBundleError("bundle manifest reproduction assets must be sorted")
         asset_paths: list[Path] = []
         folded_assets: set[str] = set()
         for asset in assets:
@@ -762,9 +724,7 @@ def validate_output_bundle(output_dir: Path) -> dict[str, Any]:
                 raise OutputBundleError(f"missing reproduction_asset role: {asset}")
             asset_paths.append(output / str(asset))
         if (output / "repro.ps1").read_bytes() != _repro_wrapper_bytes():
-            raise OutputBundleError(
-                "reproduction wrapper does not match generated template"
-            )
+            raise OutputBundleError("reproduction wrapper does not match generated template")
         _validate_rebuild_config(output / "rebuild_config.json")
         _validate_repro_lock(
             _load_json(output / "repro.lock.json", "reproduction lock"),

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# -------------------------------------------------------------------------
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
+# --------------------------------------------------------------------------
+
 """Create and advance standalone optimizer/recipe promotion handoffs."""
 
 from __future__ import annotations
@@ -14,9 +19,13 @@ import sys
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
+
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
 
 HANDOFF_SCHEMA = "model-support-promotion-v1"
 HANDOFF_FILENAME = "promotion_handoff.json"
@@ -108,7 +117,7 @@ def _atomic_write(path: Path, value: dict[str, Any], *, overwrite: bool) -> None
             stream.write(_json_bytes(value))
         if not overwrite and path.exists():
             raise PromotionError(f"promotion handoff already exists: {path}")
-        os.replace(temporary, path)
+        temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -125,14 +134,9 @@ def _is_durable_huggingface_source(value: Any) -> bool:
 def classify_routes(context: dict[str, object]) -> dict[str, object]:
     """Classify a champion into the optimizer and recipe PR routes."""
     capability = context.get("capability_change")
-    optimizer_selected = (
-        isinstance(capability, dict) and capability.get("required") is True
-    )
+    optimizer_selected = isinstance(capability, dict) and capability.get("required") is True
     recipe_selected = _is_durable_huggingface_source(context.get("source_identity"))
-    if optimizer_selected:
-        optimizer_status = "ELIGIBLE"
-    else:
-        optimizer_status = "NOT_REQUIRED"
+    optimizer_status = "ELIGIBLE" if optimizer_selected else "NOT_REQUIRED"
     if not recipe_selected:
         recipe_status = "BLOCKED_IDENTITY"
     elif optimizer_selected:
@@ -212,9 +216,7 @@ def _require_sha40(value: Any, label: str) -> str:
     return value
 
 
-def _validate_routes(
-    handoff: dict[str, Any], classification: dict[str, object]
-) -> None:
+def _validate_routes(handoff: dict[str, Any], classification: dict[str, object]) -> None:
     if handoff.get("order") != classification["order"]:
         raise PromotionError("route order drift")
     actual = _route_map(handoff.get("routes"))
@@ -348,9 +350,11 @@ def validate_handoff(handoff_path: Path) -> dict[str, Any]:
 
 
 def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    command = ["git", "-C", str(repo), *arguments]
+    run_process = subprocess.run
     try:
-        return subprocess.run(
-            ["git", "-C", str(repo), *arguments],
+        return run_process(
+            command,
             capture_output=True,
             text=True,
             check=False,
@@ -423,9 +427,7 @@ def update_route(
     if status == "MERGED" and handoff["order"] == ["optimizer", "recipe"]:
         if optimizer_repo is None:
             raise PromotionError("mixed optimizer MERGED requires optimizer repo")
-        stored_reviewed = _require_sha40(
-            state.get("reviewed_sha"), "optimizer reviewed SHA"
-        )
+        stored_reviewed = _require_sha40(state.get("reviewed_sha"), "optimizer reviewed SHA")
         repo = Path(optimizer_repo).resolve()
         verified_merged, verified_main = _verify_mixed_merge(
             repo,
@@ -442,10 +444,15 @@ def update_route(
         }
         routes["recipe"]["status"] = "ELIGIBLE"
     state["status"] = status
-    _validate_routes(handoff, classify_routes(_load_json(
-        _absolute_file(handoff["context"]["path"], "context"),
-        "promotion context",
-    )))
+    _validate_routes(
+        handoff,
+        classify_routes(
+            _load_json(
+                _absolute_file(handoff["context"]["path"], "context"),
+                "promotion context",
+            )
+        ),
+    )
     _atomic_write(path, handoff, overwrite=True)
     return validate_handoff(path)
 
@@ -460,6 +467,7 @@ def _summary(path: Path, handoff: dict[str, Any]) -> dict[str, Any]:
 
 
 def main(argv: list[str]) -> int:
+    """Create, validate, or update a promotion handoff from CLI arguments."""
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("create")

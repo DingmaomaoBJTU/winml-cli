@@ -9,10 +9,14 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = SKILL_ROOT / "scripts" / "render_report.py"
@@ -20,9 +24,7 @@ MODULE_PATH = SKILL_ROOT / "scripts" / "render_report.py"
 
 @pytest.fixture(scope="module")
 def report_module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "auto_optimize_render_report", MODULE_PATH
-    )
+    spec = importlib.util.spec_from_file_location("auto_optimize_render_report", MODULE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

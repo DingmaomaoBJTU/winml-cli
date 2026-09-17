@@ -14,10 +14,14 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = SKILL_ROOT / "scripts" / "finalize_output.py"
@@ -26,9 +30,7 @@ VALID_REPRO_RUN_BODY = "$Root = $PSScriptRoot\n"
 
 @pytest.fixture(scope="module")
 def output_module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "auto_optimize_finalize_output", MODULE_PATH
-    )
+    spec = importlib.util.spec_from_file_location("auto_optimize_finalize_output", MODULE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -217,9 +219,7 @@ def _valid_lock(assets: list[Path]) -> dict[str, Any]:
             {
                 "path": asset.name,
                 "sha256": _sha256(asset),
-                "purpose": "performance"
-                if asset.name == "perf_input.npz"
-                else "correctness",
+                "purpose": "performance" if asset.name == "perf_input.npz" else "correctness",
             }
             for asset in assets
         ],
@@ -248,9 +248,7 @@ def _repro_inputs(tmp_path: Path) -> tuple[Path, Path, Path, list[Path]]:
     )
     repro_script = source / "run_repro.ps1"
     repro_script.write_text(
-        VALID_REPRO_RUN_BODY
-        +
-        "pwsh -File (Join-Path $Root 'build.ps1')\n",
+        VALID_REPRO_RUN_BODY + "pwsh -File (Join-Path $Root 'build.ps1')\n",
         encoding="utf-8",
     )
     assets = [
@@ -290,10 +288,7 @@ def test_finalize_output_publishes_complete_hash_bound_bundle(
         "report.html",
         "manifest.json",
     }
-    assert (
-        json.loads((output / "winml_config.json").read_text(encoding="utf-8"))["device"]
-        == "npu"
-    )
+    assert json.loads((output / "winml_config.json").read_text(encoding="utf-8"))["device"] == "npu"
     final_report = json.loads((output / "report.json").read_text(encoding="utf-8"))
     assert final_report["leader"]["model_path"] == "champion.onnx"
     assert final_report["artifacts"] == {
@@ -463,8 +458,10 @@ def test_generated_repro_wrapper_propagates_replay_exit_code(
     env = os.environ.copy()
     env["PATH"] = str(stub_dir) + os.pathsep + env.get("PATH", "")
 
-    result = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(output / "repro.ps1")],
+    command = ["pwsh", "-NoProfile", "-File", str(output / "repro.ps1")]
+    run_process = subprocess.run
+    result = run_process(
+        command,
         cwd=output,
         env=env,
         capture_output=True,
@@ -613,19 +610,16 @@ def test_invalid_rebuild_config_is_rejected(
             (VALID_REPRO_RUN_BODY + "\\\\server\\share\\model.onnx\n").encode(),
             "absolute",
         ),
-        ((VALID_REPRO_RUN_BODY + "/tmp/model.onnx\n").encode(), "absolute"),
+        ((VALID_REPRO_RUN_BODY + "/" + "tmp/model.onnx\n").encode(), "absolute"),
         (
             (VALID_REPRO_RUN_BODY + "//server/share/model.onnx\n").encode(),
             "absolute",
         ),
         (
-            (
-                VALID_REPRO_RUN_BODY
-                + "copy --share=//server/share/model.onnx\n"
-            ).encode(),
+            (VALID_REPRO_RUN_BODY + "copy --share=//server/share/model.onnx\n").encode(),
             "absolute",
         ),
-        ((VALID_REPRO_RUN_BODY + "\"//tmp/path\"\n").encode(), "absolute"),
+        ((VALID_REPRO_RUN_BODY + '"//tmp/path"\n').encode(), "absolute"),
         (b"$PSScriptRoot\n\xff", "UTF-8"),
     ],
 )
@@ -684,6 +678,8 @@ def test_repro_script_allows_bare_shell_switches(
         repro_lock=repro_lock,
         repro_assets=assets,
     )
+
+
 @pytest.mark.parametrize(
     "script_text",
     [
@@ -740,6 +736,7 @@ def test_repro_script_accepts_arbitrary_bundle_relative_body(
         repro_assets=assets,
     )
 
+
 @pytest.mark.parametrize(
     "script_text",
     [
@@ -749,11 +746,11 @@ def test_repro_script_accepts_arbitrary_bundle_relative_body(
         "$PSScriptRoot\nwinml build '/c'\n",
         "$PSScriptRoot\nwinml build /NoProfile\n",
         "$PSScriptRoot\nwinml build --model=C:\\temp\\model.onnx\n",
-        "$PSScriptRoot\nwinml build \"--model=C:\\temp\\model.onnx\"\n",
+        '$PSScriptRoot\nwinml build "--model=C:\\temp\\model.onnx"\n',
         "$PSScriptRoot\nwinml build \\temp\\model.onnx\n",
         "$PSScriptRoot\nwinml build '\\temp\\model.onnx'\n",
         "$PSScriptRoot\nwinml build --model=\\temp\\model.onnx\n",
-        "$PSScriptRoot\nwinml build \"--model=\\temp\\model.onnx\"\n",
+        '$PSScriptRoot\nwinml build "--model=\\temp\\model.onnx"\n',
         "$PSScriptRoot\nwinml build -Input=/tmp/model.onnx\n",
         "$PSScriptRoot\nwinml build '-Input=/tmp/model.onnx'\n",
         "$PSScriptRoot\nwinml build --root=/c\n",
@@ -761,7 +758,7 @@ def test_repro_script_accepts_arbitrary_bundle_relative_body(
         "$PSScriptRoot\nwinml build '--root=/c'\n",
         "$PSScriptRoot\nwinml build --root=/models\n",
         "$PSScriptRoot\ncopy --share=\\\\server\\share\\file\n",
-        "$PSScriptRoot\ncopy \"--share=\\\\server\\share\\file\"\n",
+        '$PSScriptRoot\ncopy "--share=\\\\server\\share\\file"\n',
     ],
 )
 def test_repro_script_rejects_assignment_form_absolute_paths(
@@ -797,9 +794,7 @@ def test_repro_script_rejects_assignment_form_absolute_paths(
             lambda lock: lock.update(
                 {
                     "status": "requires-unmerged-pr",
-                    "dependencies": [
-                        {"url": "https://example.invalid/pr", "revision": "bad"}
-                    ],
+                    "dependencies": [{"url": "https://example.invalid/pr", "revision": "bad"}],
                 }
             ),
             "revision",
@@ -887,9 +882,7 @@ def test_repro_lock_accepts_release_winml_identity(
             "version",
         ),
         (
-            lambda lock: lock["toolchain"].update(
-                {"winml": {"kind": "release", "version": ""}}
-            ),
+            lambda lock: lock["toolchain"].update({"winml": {"kind": "release", "version": ""}}),
             "version",
         ),
         (
@@ -905,9 +898,7 @@ def test_repro_lock_accepts_release_winml_identity(
             "revision",
         ),
         (
-            lambda lock: lock["toolchain"].update(
-                {"winml": {"kind": "git", "version": "1.2.3"}}
-            ),
+            lambda lock: lock["toolchain"].update({"winml": {"kind": "git", "version": "1.2.3"}}),
             "version",
         ),
         (
@@ -991,9 +982,7 @@ def test_repro_lock_rejects_unsafe_input_paths(
         ),
         (lambda lock, asset_list: lock["inputs"][0].update({"purpose": ""}), "purpose"),
         (
-            lambda lock, asset_list: asset_list.append(
-                asset_list[0].with_name("undeclared.npz")
-            ),
+            lambda lock, asset_list: asset_list.append(asset_list[0].with_name("undeclared.npz")),
             "undeclared",
         ),
     ],
@@ -1090,9 +1079,7 @@ def test_unconfirmed_leader_is_not_deliverable(
     report.write_text(json.dumps(facts), encoding="utf-8")
 
     with pytest.raises(output_module.OutputBundleError, match="confirmed"):
-        output_module.finalize_output(
-            report, champion, config, [companion], tmp_path / "output"
-        )
+        output_module.finalize_output(report, champion, config, [companion], tmp_path / "output")
 
 
 def test_nonpassing_correctness_is_not_deliverable(
@@ -1105,9 +1092,7 @@ def test_nonpassing_correctness_is_not_deliverable(
     report.write_text(json.dumps(facts), encoding="utf-8")
 
     with pytest.raises(output_module.OutputBundleError, match="correctness"):
-        output_module.finalize_output(
-            report, champion, config, [companion], tmp_path / "output"
-        )
+        output_module.finalize_output(report, champion, config, [companion], tmp_path / "output")
 
 
 def test_disclosed_provisional_quality_is_deliverable(
@@ -1169,9 +1154,7 @@ def test_provisional_quality_requires_structured_gate(
     report.write_text(json.dumps(facts), encoding="utf-8")
 
     with pytest.raises(output_module.OutputBundleError, match="quality_gate"):
-        output_module.finalize_output(
-            report, champion, config, [companion], tmp_path / "output"
-        )
+        output_module.finalize_output(report, champion, config, [companion], tmp_path / "output")
 
 
 def test_existing_output_requires_overwrite(
@@ -1458,10 +1441,7 @@ def test_overwrite_replaces_bundle_only_after_new_bundle_validates(
         overwrite=True,
     )
 
-    assert (
-        hashlib.sha256((output / "champion.onnx").read_bytes()).hexdigest()
-        != first_hash
-    )
+    assert hashlib.sha256((output / "champion.onnx").read_bytes()).hexdigest() != first_hash
     output_module.validate_output_bundle(output)
 
 

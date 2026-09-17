@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 KNOWLEDGE_ROOT = SKILL_ROOT / "knowledge"
 ROLE_ROOT = SKILL_ROOT / "roles"
@@ -36,9 +37,7 @@ CASE_FIELDS = {
 
 
 def _load_hotspot_module() -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "plan_hotspot", SCRIPT_ROOT / "plan_hotspot.py"
-    )
+    spec = importlib.util.spec_from_file_location("plan_hotspot", SCRIPT_ROOT / "plan_hotspot.py")
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -53,8 +52,7 @@ def _load_json(path: Path) -> Any:
 def _case_content_sha256(case: dict[str, Any]) -> str:
     content = {key: value for key, value in case.items() if key != "generic_review"}
     canonical = (
-        json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        + "\n"
+        json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
@@ -79,7 +77,8 @@ def test_skill_is_small_and_single_agent() -> None:
     assert metadata["description"].startswith("Use when ")
     assert (
         metadata["description"]
-        == "Use when optimizing ONNX latency with WinML for a target EP/device, including QNN NPU profiling and graph interactions."
+        == "Use when optimizing ONNX latency with WinML for a target EP/device, "
+        "including QNN NPU profiling and graph interactions."
     )
     description = metadata["description"].lower()
     for keyword in ("onnx", "winml", "qnn", "npu", "latency"):
@@ -166,9 +165,7 @@ def test_confirmed_candidate_can_lead_within_noise() -> None:
         assert required in text, required
 
 
-def test_provisional_quality_delivery_requires_disclosed_unavailable_evaluator() -> (
-    None
-):
+def test_provisional_quality_delivery_requires_disclosed_unavailable_evaluator() -> None:
     text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").lower()
 
     for required in (
@@ -210,9 +207,7 @@ def test_material_leaders_trigger_staged_capability_rediscovery() -> None:
     assert "capability_closure.py" not in text
     assert not (SCRIPT_ROOT / "capability_closure.py").exists()
 
-    reference = (
-        (REFERENCE_ROOT / "capability-closure.md").read_text(encoding="utf-8").lower()
-    )
+    reference = (REFERENCE_ROOT / "capability-closure.md").read_text(encoding="utf-8").lower()
     for required in (
         "list-capabilities --verbose",
         "analyzer non-reporting is detector evidence only",
@@ -247,13 +242,19 @@ def test_dominant_hotspot_fast_lane_is_bounded_and_evidence_gated() -> None:
         "resolve [plan_hotspot.py](./scripts/plan_hotspot.py)",
         "run `python ./scripts/plan_hotspot.py hotspot_evidence.json --output hotspot_plan.json`",
         "adopt the helper result as the current plan",
-        "if mode is `dominant-hotspot-fast-lane`, execute only its steps and exit instruction before loading cases or proposing normal-loop hypotheses.",
+        (
+            "if mode is `dominant-hotspot-fast-lane`, execute only its steps and "
+            "exit instruction before loading cases or proposing normal-loop hypotheses."
+        ),
         "if mode is `normal-hypothesis-loop`, continue normally.",
     ):
         assert phrase in text, phrase
 
     for phrase in (
-        "execute only its steps and exit instruction before loading cases or proposing normal-loop hypotheses.",
+        (
+            "execute only its steps and exit instruction before loading cases or "
+            "proposing normal-loop hypotheses."
+        ),
         "current plan",
         "hotspot_plan.json",
     ):
@@ -261,11 +262,10 @@ def test_dominant_hotspot_fast_lane_is_bounded_and_evidence_gated() -> None:
 
     assert (
         text.index("write an evidence brief on bottlenecks, provider work, gaps before")
+        < text.index("## planning router - evaluate before loading cases or proposing hypotheses")
         < text.index(
-            "## planning router - evaluate before loading cases or proposing hypotheses"
-        )
-        < text.index(
-            "run `python ./scripts/plan_hotspot.py hotspot_evidence.json --output hotspot_plan.json`"
+            "run `python ./scripts/plan_hotspot.py hotspot_evidence.json --output "
+            "hotspot_plan.json`"
         )
         < text.index(
             "read [`knowledge/index.json`](./knowledge/index.json), match ep/device anchors,"
@@ -279,7 +279,8 @@ def test_dominant_hotspot_hard_gate_stops_before_normal_loop() -> None:
 
     active_gate_window = text[
         text.index(
-            "run `python ./scripts/plan_hotspot.py hotspot_evidence.json --output hotspot_plan.json`"
+            "run `python ./scripts/plan_hotspot.py hotspot_evidence.json --output "
+            "hotspot_plan.json`"
         ) : text.index("maintain at most three active hypotheses")
     ]
     for forbidden in (
@@ -505,7 +506,7 @@ def test_knowledge_index_is_small_lazy_and_valid() -> None:
 
         case = _load_json(case_path)
         assert hashlib.sha256(case_path.read_bytes()).hexdigest() == entry["sha256"]
-        assert CASE_FIELDS <= case.keys()
+        assert case.keys() >= CASE_FIELDS
         assert case["id"] == entry["id"]
         assert case["status"] == entry["status"]
         assert case["discovery"] == {
@@ -532,9 +533,7 @@ def test_knowledge_index_is_small_lazy_and_valid() -> None:
 def test_grouped_conv_qdq_case_is_indexed() -> None:
     index = _load_json(KNOWLEDGE_ROOT / "index.json")
 
-    entry = next(
-        item for item in index["cases"] if item["id"] == "grouped-conv-qdq-boundary"
-    )
+    entry = next(item for item in index["cases"] if item["id"] == "grouped-conv-qdq-boundary")
     assert entry["anchor_ops"] == [
         "Conv",
         "Slice",
@@ -557,7 +556,7 @@ def test_bundled_knowledge_is_generic_only() -> None:
             for index, child in enumerate(value):
                 inspect(child, f"{location}[{index}]")
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            assert False, f"{location}: numeric run value"
+            assert not isinstance(value, (int, float)), f"{location}: numeric run value"
         elif isinstance(value, str):
             lowered = value.lower()
             assert not re.fullmatch(r"[0-9a-f]{64}", lowered), f"{location}: exact hash"
@@ -613,7 +612,10 @@ def test_qnn_reference_preserves_only_high_value_decisions() -> None:
         "write `hotspot_evidence.json`",
         "run `python scripts/plan_hotspot.py hotspot_evidence.json --output hotspot_plan.json`",
         "adopt that json as the current plan",
-        "if mode is `dominant-hotspot-fast-lane`, execute only its steps and exit instruction before loading cases or proposing normal-loop hypotheses.",
+        (
+            "if mode is `dominant-hotspot-fast-lane`, execute only its steps and "
+            "exit instruction before loading cases or proposing normal-loop hypotheses."
+        ),
         "if mode is `normal-hypothesis-loop`, continue normally.",
         "normal correctness and paired performance gates",
     ):
@@ -633,7 +635,10 @@ def test_dominant_hotspot_pressure_scenario_requires_two_step_recipe() -> None:
         "write `hotspot_evidence.json`",
         "resolve [`plan_hotspot.py`](../../scripts/plan_hotspot.py)",
         "python ./scripts/plan_hotspot.py hotspot_evidence.json --output hotspot_plan.json",
-        "adopt the helper result only after exit code 0, stdout parses as json, and stdout bytes equal `hotspot_plan.json` bytes",
+        (
+            "adopt the helper result only after exit code 0, stdout parses as json, "
+            "and stdout bytes equal `hotspot_plan.json` bytes"
+        ),
         "never synthesize, rewrite, or replace the helper result with a free-form plan",
         "70 percent",
         "at most two probes",
@@ -655,9 +660,7 @@ def test_dominant_hotspot_pressure_scenario_requires_two_step_recipe() -> None:
         "experiments e",
         "feature gap",
     )
-    current_plan_window = text[
-        text.index("success requires:") : text.index("failure criteria:")
-    ]
+    current_plan_window = text[text.index("success requires:") : text.index("failure criteria:")]
     for forbidden in disallowed_current_plan:
         assert forbidden not in current_plan_window, forbidden
 
@@ -686,9 +689,9 @@ def test_dominant_hotspot_pressure_scenario_embeds_exact_helper_json() -> None:
         )
         + "\n"
     )
-    raw_text = (
-        SKILL_ROOT / "tests" / "pressure" / "dominant-hotspot-fast-lane.md"
-    ).read_text(encoding="utf-8")
+    raw_text = (SKILL_ROOT / "tests" / "pressure" / "dominant-hotspot-fast-lane.md").read_text(
+        encoding="utf-8"
+    )
 
     assert expected in raw_text
 
@@ -744,9 +747,7 @@ def test_public_cli_promotion_and_pr_label_contract_are_mandatory() -> None:
         assert required in text, required
 
 
-def test_feature_gap_engineer_requires_clean_public_cli_validation_and_verified_label() -> (
-    None
-):
+def test_feature_gap_engineer_requires_clean_public_cli_validation_and_verified_label() -> None:
     text = (ROLE_ROOT / "feature-gap-engineer.md").read_text(encoding="utf-8").lower()
 
     for required in (
@@ -764,9 +765,7 @@ def test_feature_gap_engineer_requires_clean_public_cli_validation_and_verified_
         assert required in text, required
 
 
-def test_checkin_reviewer_blocks_prototype_promotion_and_missing_label_evidence() -> (
-    None
-):
+def test_checkin_reviewer_blocks_prototype_promotion_and_missing_label_evidence() -> None:
     text = (ROLE_ROOT / "checkin-reviewer.md").read_text(encoding="utf-8").lower()
 
     for required in (

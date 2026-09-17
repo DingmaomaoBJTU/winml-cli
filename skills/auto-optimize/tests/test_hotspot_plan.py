@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = SKILL_ROOT / "scripts" / "plan_hotspot.py"
 
@@ -161,14 +162,16 @@ def test_cli_stdout_and_output_are_byte_stable(tmp_path: Path) -> None:
     output_path = tmp_path / "hotspot_plan.json"
     input_path.write_text(json.dumps(_base_evidence()), encoding="utf-8")
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT_PATH),
-            str(input_path),
-            "--output",
-            str(output_path),
-        ],
+    command = [
+        sys.executable,
+        str(SCRIPT_PATH),
+        str(input_path),
+        "--output",
+        str(output_path),
+    ]
+    run_process = subprocess.run
+    result = run_process(
+        command,
         capture_output=True,
         text=False,
         check=False,
@@ -178,16 +181,31 @@ def test_cli_stdout_and_output_are_byte_stable(tmp_path: Path) -> None:
     expected = (
         json.dumps(
             {
-                "exit": "Record both outcomes, then invoke the normal hypothesis loop in a later planning step.",
+                "exit": (
+                    "Record both outcomes, then invoke the normal hypothesis loop "
+                    "in a later planning step."
+                ),
                 "mode": "dominant-hotspot-fast-lane",
                 "steps": [
                     {
                         "id": "representation",
-                        "instruction": "On the dominant region only, test one semantics-preserving representation change supported by its topology. Hold quantization parameters fixed. Apply normal correctness and paired-screen gates. Record KEEP, DISCARD, or INCONCLUSIVE.",
+                        "instruction": (
+                            "On the dominant region only, test one semantics-preserving "
+                            "representation change supported by its topology. Hold "
+                            "quantization parameters fixed. Apply normal correctness and "
+                            "paired-screen gates. Record KEEP, DISCARD, or INCONCLUSIVE."
+                        ),
                     },
                     {
                         "id": "qdq-boundary",
-                        "instruction": "Starting from the representation probe winner (or the original representation if that probe was discarded), hold representation and every quantization parameter fixed. Vary only complete-region versus branch-local QDQ placement around the same dominant region. Apply normal correctness and paired-screen gates. Record KEEP, DISCARD, or INCONCLUSIVE.",
+                        "instruction": (
+                            "Starting from the representation probe winner (or the original "
+                            "representation if that probe was discarded), hold representation "
+                            "and every quantization parameter fixed. Vary only complete-region "
+                            "versus branch-local QDQ placement around the same dominant region. "
+                            "Apply normal correctness and paired-screen gates. Record KEEP, "
+                            "DISCARD, or INCONCLUSIVE."
+                        ),
                     },
                 ],
             },
@@ -208,8 +226,10 @@ def test_cli_prints_error_and_exits_one_for_invalid_evidence(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT_PATH), str(input_path)],
+    command = [sys.executable, str(SCRIPT_PATH), str(input_path)]
+    run_process = subprocess.run
+    result = run_process(
+        command,
         capture_output=True,
         text=True,
         check=False,

@@ -10,12 +10,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
+
 
 CASE_FIELDS = {
     "id",
@@ -42,7 +42,9 @@ STATUS_EVIDENCE_CLASSES = {
     "rejected": "paired-performance-rejected",
     "inconclusive": "paired-performance-inconclusive",
 }
-RUN_LOCAL_SCOPE_NOTE = "exact model, graph occurrence, toolchain, artifacts, and measurements remain run-local"
+RUN_LOCAL_SCOPE_NOTE = (
+    "exact model, graph occurrence, toolchain, artifacts, and measurements remain run-local"
+)
 GENERIC_NUMBERED_TERMS = re.compile(
     r"\b(?:FP16|FP32|INT8|INT16|W8A8|W8A16|Conv1D|Conv2D|Conv3D)\b",
     re.IGNORECASE,
@@ -79,8 +81,7 @@ def case_content_sha256(case: dict[str, Any]) -> str:
     """Hash canonical case content excluding its independent-review envelope."""
     content = {key: value for key, value in case.items() if key != "generic_review"}
     canonical = (
-        json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        + "\n"
+        json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
@@ -89,16 +90,10 @@ def _validate_generic_text(value: str, location: str) -> None:
     generic_text = GENERIC_DOTTED_TERMS.sub("", value)
     lowered = generic_text.lower()
     if re.search(r"\b[a-z][a-z0-9+.-]*://", generic_text, re.IGNORECASE):
-        raise KnowledgeError(
-            f"bundled knowledge must be model-agnostic; {location} is a URL"
-        )
+        raise KnowledgeError(f"bundled knowledge must be model-agnostic; {location} is a URL")
     if re.search(r"\b[0-9a-f]{32}\b|\b[0-9a-f]{40}\b|\b[0-9a-f]{64}\b", lowered):
-        raise KnowledgeError(
-            f"bundled knowledge must be model-agnostic; {location} embeds a hash"
-        )
-    if re.search(
-        r"\b(?:sha|hash|commit|revision|rev)\s*[:=#]?\s*[0-9a-f]{7,}\b", lowered
-    ):
+        raise KnowledgeError(f"bundled knowledge must be model-agnostic; {location} embeds a hash")
+    if re.search(r"\b(?:sha|hash|commit|revision|rev)\s*[:=#]?\s*[0-9a-f]{7,}\b", lowered):
         raise KnowledgeError(
             f"bundled knowledge must be model-agnostic; {location} embeds a revision"
         )
@@ -170,9 +165,7 @@ def _validate_case(case: Any) -> dict[str, Any]:
     content = {key: value for key, value in case.items() if key != "generic_review"}
     _validate_model_agnostic(content)
     case_id = case["id"]
-    if not isinstance(case_id, str) or not re.fullmatch(
-        r"[a-z0-9]+(?:-[a-z0-9]+)*", case_id
-    ):
+    if not isinstance(case_id, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", case_id):
         raise KnowledgeError("case id must be lowercase kebab-case")
     for field in CASE_FIELDS - {"id"}:
         if case[field] in (None, "", [], {}):
@@ -180,35 +173,23 @@ def _validate_case(case: Any) -> dict[str, Any]:
     scope = case["scope"]
     if not isinstance(scope, dict) or set(scope) != SCOPE_FIELDS:
         raise KnowledgeError(
-            "bundled knowledge must be model-agnostic; scope must contain only ep, device, and graph_requirements"
+            "bundled knowledge must be model-agnostic; scope must contain only "
+            "ep, device, and graph_requirements"
         )
-    if (
-        not isinstance(scope["graph_requirements"], list)
-        or not scope["graph_requirements"]
-    ):
+    if not isinstance(scope["graph_requirements"], list) or not scope["graph_requirements"]:
         raise KnowledgeError("scope.graph_requirements must be non-empty")
     provenance = case["provenance"]
     if not isinstance(provenance, dict) or set(provenance) != PROVENANCE_FIELDS:
-        raise KnowledgeError(
-            "provenance must contain only evidence_class and scope_note"
-        )
+        raise KnowledgeError("provenance must contain only evidence_class and scope_note")
     expected_evidence_class = STATUS_EVIDENCE_CLASSES.get(case["status"])
-    if (
-        expected_evidence_class is None
-        or provenance["evidence_class"] != expected_evidence_class
-    ):
+    if expected_evidence_class is None or provenance["evidence_class"] != expected_evidence_class:
         raise KnowledgeError(
             "case status and provenance.evidence_class must identify the same tested outcome"
         )
     if provenance["scope_note"] != RUN_LOCAL_SCOPE_NOTE:
-        raise KnowledgeError(
-            "provenance.scope_note must preserve exact evidence run-local"
-        )
+        raise KnowledgeError("provenance.scope_note must preserve exact evidence run-local")
     generic_review = case["generic_review"]
-    if (
-        not isinstance(generic_review, dict)
-        or set(generic_review) != GENERIC_REVIEW_FIELDS
-    ):
+    if not isinstance(generic_review, dict) or set(generic_review) != GENERIC_REVIEW_FIELDS:
         raise KnowledgeError("generic_review has invalid fields")
     if (
         generic_review.get("verdict") != "GENERIC_CASE_APPROVED"
@@ -218,9 +199,7 @@ def _validate_case(case: Any) -> dict[str, Any]:
             "generic_review must be GENERIC_CASE_APPROVED by independent-graph-scout"
         )
     if generic_review.get("content_sha256") != case_content_sha256(case):
-        raise KnowledgeError(
-            "generic_review.content_sha256 does not match case content"
-        )
+        raise KnowledgeError("generic_review.content_sha256 does not match case content")
     discovery = case["discovery"]
     if not isinstance(discovery, dict) or set(discovery) != DISCOVERY_FIELDS:
         raise KnowledgeError("case discovery has invalid fields")
@@ -319,9 +298,9 @@ def store_case(case: dict[str, Any], knowledge_root: Path) -> Path:
     try:
         case_temp.write_bytes(case_bytes)
         index_temp.write_bytes(index_bytes)
-        os.replace(case_temp, case_path)
+        case_temp.replace(case_path)
         case_published = True
-        os.replace(index_temp, index_path)
+        index_temp.replace(index_path)
         index_replaced = True
         validate_knowledge(knowledge_root)
     except Exception:
@@ -330,7 +309,7 @@ def store_case(case: dict[str, Any], knowledge_root: Path) -> Path:
         if index_replaced:
             rollback = _temp_path(knowledge_root, "index-rollback")
             rollback.write_bytes(previous_index)
-            os.replace(rollback, index_path)
+            rollback.replace(index_path)
         raise
     finally:
         case_temp.unlink(missing_ok=True)

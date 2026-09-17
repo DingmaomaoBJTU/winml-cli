@@ -9,13 +9,16 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 import sys
 from pathlib import Path
-from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = SKILL_ROOT / "scripts" / "save_case.py"
@@ -23,9 +26,7 @@ MODULE_PATH = SKILL_ROOT / "scripts" / "save_case.py"
 
 @pytest.fixture(scope="module")
 def store_module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "auto_optimize_save_case", MODULE_PATH
-    )
+    spec = importlib.util.spec_from_file_location("auto_optimize_save_case", MODULE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -54,7 +55,10 @@ def _case(case_id: str = "new-case") -> dict[str, Any]:
         "counterexamples": ["Scoped to this graph and toolchain."],
         "provenance": {
             "evidence_class": "paired-performance-confirmed",
-            "scope_note": "exact model, graph occurrence, toolchain, artifacts, and measurements remain run-local",
+            "scope_note": (
+                "exact model, graph occurrence, toolchain, artifacts, and measurements "
+                "remain run-local"
+            ),
         },
         "generic_review": {
             "verdict": "GENERIC_CASE_APPROVED",
@@ -123,18 +127,14 @@ def test_duplicate_case_is_rejected_without_mutation(
     root = _knowledge_root(tmp_path)
     store_module.store_case(_case(), root)
     before = {
-        path.relative_to(root): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
+        path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()
     }
 
     with pytest.raises(store_module.KnowledgeError, match="already exists"):
         store_module.store_case(_case(), root)
 
     after = {
-        path.relative_to(root): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
+        path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()
     }
     assert after == before
 
@@ -313,9 +313,7 @@ def test_content_digest_mode_is_read_only(
     assert list(tmp_path.iterdir()) == [record]
 
 
-@pytest.mark.parametrize(
-    "evidence_class", ["unverified idea", "hypothetical mechanism"]
-)
+@pytest.mark.parametrize("evidence_class", ["unverified idea", "hypothetical mechanism"])
 def test_unverified_provenance_is_rejected(
     store_module: ModuleType,
     tmp_path: Path,
@@ -367,7 +365,7 @@ def test_extra_top_level_and_discovery_fields_are_rejected(
     case["discovery"]["extra"] = "private context"
     case["generic_review"]["content_sha256"] = store_module.case_content_sha256(case)
 
-    with pytest.raises(store_module.KnowledgeError, match="fields|discovery"):
+    with pytest.raises(store_module.KnowledgeError, match=r"fields|discovery"):
         store_module.store_case(case, root)
 
 
@@ -378,17 +376,17 @@ def test_index_replace_failure_rolls_back_case(
 ) -> None:
     root = _knowledge_root(tmp_path)
     before = (root / "index.json").read_bytes()
-    real_replace = os.replace
+    real_replace = Path.replace
     calls = 0
 
-    def fail_second_replace(source: str | Path, destination: str | Path) -> None:
+    def fail_second_replace(source: Path, destination: str | Path) -> Path:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("injected index replace failure")
-        real_replace(source, destination)
+        return real_replace(source, destination)
 
-    monkeypatch.setattr(store_module.os, "replace", fail_second_replace)
+    monkeypatch.setattr(Path, "replace", fail_second_replace)
 
     with pytest.raises(OSError, match="injected"):
         store_module.store_case(_case(), root)

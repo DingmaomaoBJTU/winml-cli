@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+
 ALLOWED_OUTCOME_VALUES = {None, "KEEP", "DISCARD", "INCONCLUSIVE"}
 STEP_ORDER = ("representation", "qdq-boundary")
 STEP_INSTRUCTIONS = {
@@ -31,8 +32,7 @@ STEP_INSTRUCTIONS = {
     ),
 }
 EXIT_INSTRUCTION = (
-    "Record both outcomes, then invoke the normal hypothesis loop in a later "
-    "planning step."
+    "Record both outcomes, then invoke the normal hypothesis loop in a later planning step."
 )
 
 
@@ -54,14 +54,10 @@ def _require_bool(value: Any, field_name: str) -> bool:
 
 def _require_percentage(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise HotspotPlanError(
-            "dominant_accelerator_time_pct must be a number in [0, 100]"
-        )
+        raise HotspotPlanError("dominant_accelerator_time_pct must be a number in [0, 100]")
     percentage = float(value)
     if percentage < 0 or percentage > 100:
-        raise HotspotPlanError(
-            "dominant_accelerator_time_pct must be a number in [0, 100]"
-        )
+        raise HotspotPlanError("dominant_accelerator_time_pct must be a number in [0, 100]")
     return percentage
 
 
@@ -69,17 +65,13 @@ def _validate_outcomes(value: Any) -> dict[str, str | None]:
     outcomes = _require_mapping(value, "outcomes")
     unknown_keys = sorted(set(outcomes) - set(STEP_ORDER))
     if unknown_keys:
-        raise HotspotPlanError(
-            f"outcomes contains unsupported step ids: {', '.join(unknown_keys)}"
-        )
+        raise HotspotPlanError(f"outcomes contains unsupported step ids: {', '.join(unknown_keys)}")
 
     normalized: dict[str, str | None] = {}
     for step_id in STEP_ORDER:
         outcome = outcomes.get(step_id)
         if outcome not in ALLOWED_OUTCOME_VALUES:
-            raise HotspotPlanError(
-                "outcome values must be null, KEEP, DISCARD, or INCONCLUSIVE"
-            )
+            raise HotspotPlanError("outcome values must be null, KEEP, DISCARD, or INCONCLUSIVE")
         normalized[step_id] = outcome
     return normalized
 
@@ -97,15 +89,13 @@ def _dominant_plan(step_ids: list[str]) -> dict[str, Any]:
         "exit": EXIT_INSTRUCTION,
         "mode": "dominant-hotspot-fast-lane",
         "steps": [
-            {"id": step_id, "instruction": STEP_INSTRUCTIONS[step_id]}
-            for step_id in step_ids
+            {"id": step_id, "instruction": STEP_INSTRUCTIONS[step_id]} for step_id in step_ids
         ],
     }
 
 
 def plan_hotspot(evidence: dict[str, Any]) -> dict[str, Any]:
     """Return a deterministic hotspot plan for the supplied evidence."""
-
     data = _require_mapping(evidence, "evidence")
     schema_version = data.get("schema_version")
     if schema_version != 1:
@@ -115,9 +105,7 @@ def plan_hotspot(evidence: dict[str, Any]) -> dict[str, Any]:
     if provider_attribution not in {"valid", "invalid"}:
         raise HotspotPlanError("provider_attribution must be 'valid' or 'invalid'")
 
-    dominant_accelerator_time_pct = _require_percentage(
-        data.get("dominant_accelerator_time_pct")
-    )
+    dominant_accelerator_time_pct = _require_percentage(data.get("dominant_accelerator_time_pct"))
     fallback_is_larger_explanation = _require_bool(
         data.get("fallback_is_larger_explanation"),
         "fallback_is_larger_explanation",
@@ -133,9 +121,7 @@ def plan_hotspot(evidence: dict[str, Any]) -> dict[str, Any]:
     quantized = _require_bool(data.get("quantized"), "quantized")
     outcomes = _validate_outcomes(data.get("outcomes"))
 
-    required_steps = (
-        ["representation", "qdq-boundary"] if quantized else ["representation"]
-    )
+    required_steps = ["representation", "qdq-boundary"] if quantized else ["representation"]
     pending_steps = [step_id for step_id in required_steps if outcomes[step_id] is None]
     if not pending_steps:
         return _normal_plan("all required fast-lane outcomes are already recorded")
@@ -157,6 +143,7 @@ def _render_plan(plan: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Build and optionally persist a hotspot plan from CLI arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("--output", type=Path)

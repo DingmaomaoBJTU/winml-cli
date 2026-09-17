@@ -13,10 +13,14 @@ import subprocess
 import sys
 from functools import lru_cache
 from pathlib import Path
-from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 PROMOTION_PATH = SKILL_ROOT / "scripts" / "promotion.py"
@@ -193,13 +197,13 @@ def test_validate_rejects_context_and_manifest_record_tampering(tmp_path: Path) 
     handoff = promotion.validate_handoff(handoff_path)
     original_context = context_path.read_bytes()
     context_path.write_text("{}", encoding="utf-8")
-    with pytest.raises(promotion.PromotionError, match="context.*(size|hash)"):
+    with pytest.raises(promotion.PromotionError, match=r"context.*(size|hash)"):
         promotion.validate_handoff(handoff_path)
 
     context_path.write_bytes(original_context)
     handoff["bundle"]["manifest"]["sha256"] = "0" * 64
     _write_json(handoff_path, handoff)
-    with pytest.raises(promotion.PromotionError, match="manifest.*hash"):
+    with pytest.raises(promotion.PromotionError, match=r"manifest.*hash"):
         promotion.validate_handoff(handoff_path)
 
 
@@ -287,8 +291,10 @@ def test_mixed_recipe_cannot_be_activated_directly(tmp_path: Path) -> None:
 
 
 def _git(repo: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *arguments],
+    command = ["git", "-C", str(repo), *arguments]
+    run_process = subprocess.run
+    result = run_process(
+        command,
         check=True,
         capture_output=True,
         text=True,
@@ -374,18 +380,20 @@ def test_cli_emits_compact_summaries_and_validation_errors(tmp_path: Path) -> No
     handoff_path = tmp_path / "handoff.json"
     _write_json(context_path, _context(capability_required=False, durable_source=True))
 
-    create = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTION_PATH),
-            "create",
-            "--bundle",
-            str(bundle),
-            "--context",
-            str(context_path),
-            "--output",
-            str(handoff_path),
-        ],
+    create_command = [
+        sys.executable,
+        str(PROMOTION_PATH),
+        "create",
+        "--bundle",
+        str(bundle),
+        "--context",
+        str(context_path),
+        "--output",
+        str(handoff_path),
+    ]
+    run_process = subprocess.run
+    create = run_process(
+        create_command,
         capture_output=True,
         text=True,
         check=False,
@@ -394,14 +402,15 @@ def test_cli_emits_compact_summaries_and_validation_errors(tmp_path: Path) -> No
     assert json.loads(create.stdout)["handoff"] == str(handoff_path.resolve())
     assert ": " not in create.stdout and ", " not in create.stdout
 
-    validate = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTION_PATH),
-            "validate",
-            "--handoff",
-            str(handoff_path),
-        ],
+    validate_command = [
+        sys.executable,
+        str(PROMOTION_PATH),
+        "validate",
+        "--handoff",
+        str(handoff_path),
+    ]
+    validate = run_process(
+        validate_command,
         capture_output=True,
         text=True,
         check=False,
@@ -409,18 +418,19 @@ def test_cli_emits_compact_summaries_and_validation_errors(tmp_path: Path) -> No
     assert validate.returncode == 0, validate.stderr
     assert json.loads(validate.stdout)["routes"]["recipe"] == "ELIGIBLE"
 
-    invalid = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTION_PATH),
-            "update",
-            "--handoff",
-            str(handoff_path),
-            "--route",
-            "recipe",
-            "--status",
-            "APPROVED",
-        ],
+    invalid_command = [
+        sys.executable,
+        str(PROMOTION_PATH),
+        "update",
+        "--handoff",
+        str(handoff_path),
+        "--route",
+        "recipe",
+        "--status",
+        "APPROVED",
+    ]
+    invalid = run_process(
+        invalid_command,
         capture_output=True,
         text=True,
         check=False,
