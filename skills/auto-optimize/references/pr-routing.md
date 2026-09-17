@@ -47,3 +47,8 @@ python scripts/promotion.py update --handoff <promotion_handoff.json> --route op
 
 The handoff is outside the bundle. Route updates never mutate the validated
 model bundle, report, or manifest.
+## Bundle lifecycle
+
+Finalize and validate the replayed bundle before promotion.py create. Freeze it once the handoff records its manifest hash. Keep subsequent PR URLs and review state in the standalone handoff. Changed model evidence requires a new versioned bundle and handoff; never rewrite the bundle behind an existing handoff.
+
+Replay requires PowerShell 7.3 or newer. The generated wrapper enables native-command error handling: a nonzero native exit stops replay before later commands can overwrite the failure.

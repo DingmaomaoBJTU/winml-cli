@@ -473,6 +473,45 @@ def test_generated_repro_wrapper_propagates_replay_exit_code(
     assert result.stdout == ""
 
 
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required")
+def test_wrapper_stops_before_later_native_success(output_module, tmp_path):
+    wrapper = tmp_path / "repro.ps1"
+    wrapper.write_text(output_module.REPRO_WRAPPER_TEXT, encoding="utf-8")
+    (tmp_path / "manifest.json").write_text('{"files": []}', encoding="utf-8")
+    (tmp_path / "repro.lock.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "repro-run.ps1").write_text(
+        chr(10).join(
+            [
+                "$Root = $PSScriptRoot",
+                'pwsh -NoProfile -Command "exit 7"',
+                'Set-Content (Join-Path $Root "unexpected") yes',
+                'pwsh -NoProfile -Command "exit 0"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(  # noqa: S603 -- generated fixture and fixed PowerShell command
+        [shutil.which("pwsh"), "-NoProfile", "-Command", "function winml {}; & ./repro.ps1"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not (tmp_path / "unexpected").exists()
+
+
+def test_invalid_performance_does_not_publish_bundle(output_module, tmp_path):
+    report, champion, config, companion = _inputs(tmp_path)
+    facts = json.loads(report.read_text(encoding="utf-8"))
+    facts["leader"]["ci_low_pct"] = float("nan")
+    _write_json(report, facts)
+    output = tmp_path / "output"
+    with pytest.raises(ValueError, match="finite"):
+        output_module.finalize_output(report, champion, config, [companion], output)
+    assert not output.exists()
+
+
 def test_legacy_bundle_has_no_reproduction_object_and_still_validates(
     output_module: ModuleType,
     tmp_path: Path,

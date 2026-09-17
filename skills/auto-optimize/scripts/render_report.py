@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -241,6 +242,29 @@ def validate_report(report: Any, *, final: bool = False) -> dict[str, Any]:
         return report
 
     errors: list[str] = []
+    for section in ("baseline", "leader"):
+        metrics = report[section]
+        for field in (
+            "p50_ms",
+            "p90_ms",
+            "p99_ms",
+            "throughput_ips",
+            "gain_pct",
+            "ci_low_pct",
+            "ci_high_pct",
+        ):
+            value = metrics.get(field)
+            if value is None and field != "p50_ms":
+                continue
+            if type(value) not in (int, float) or not math.isfinite(value):
+                errors.append(f"{section}.{field} must be finite numeric evidence")
+            elif (field.endswith("_ms") or field == "throughput_ips") and value <= 0:
+                errors.append(f"{section}.{field} must be positive")
+        low, high = metrics.get("ci_low_pct"), metrics.get("ci_high_pct")
+        if (low is None) != (high is None):
+            errors.append(f"{section} confidence bounds must be supplied together")
+        elif type(low) in (int, float) and type(high) in (int, float) and low > high:
+            errors.append(f"{section} confidence bounds are reversed")
     model = report["model"]
     target = report["target"]
     baseline = report["baseline"]

@@ -22,6 +22,15 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = SKILL_ROOT / "scripts" / "render_report.py"
 
 
+@pytest.mark.parametrize("field", ["p50_ms", "gain_pct", "ci_low_pct", "ci_high_pct"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
+def test_final_report_rejects_invalid_performance(report_module, field, value):
+    report = _report()
+    report["leader"][field] = value
+    with pytest.raises(report_module.ReportError):
+        report_module.validate_report(report, final=True)
+
+
 @pytest.fixture(scope="module")
 def report_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("auto_optimize_render_report", MODULE_PATH)
@@ -30,6 +39,30 @@ def report_module() -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"p50_ms": 0},
+        {"p50_ms": -1},
+        {"ci_low_pct": 10, "ci_high_pct": 5},
+        {"ci_low_pct": None, "ci_high_pct": 5},
+    ],
+)
+def test_final_report_rejects_invalid_metric_bounds(report_module, updates):
+    report = _report()
+    report["leader"].update(updates)
+    with pytest.raises(report_module.ReportError):
+        report_module.validate_report(report, final=True)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True, 0, -1])
+def test_final_report_rejects_invalid_baseline(report_module, value):
+    report = _report()
+    report["baseline"]["p50_ms"] = value
+    with pytest.raises(report_module.ReportError):
+        report_module.validate_report(report, final=True)
 
 
 def _report() -> dict[str, Any]:

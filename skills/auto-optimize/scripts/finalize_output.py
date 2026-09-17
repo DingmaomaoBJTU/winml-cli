@@ -77,7 +77,9 @@ SLASH_SWITCH_COMMANDS = {
 
 REPRO_WRAPPER_TEXT = (
     """param([switch]$ValidateOnly)
+#requires -Version 7.3
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
 
 function Read-BundleJson($RelativePath) {
     $Path = Join-Path $PSScriptRoot $RelativePath

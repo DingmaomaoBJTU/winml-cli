@@ -374,6 +374,13 @@ def test_llm_closure_pressure_scenario_covers_analyzer_false_negative() -> None:
         assert required in scenario, required
 
 
+def test_bundle_publication_precedes_promotion() -> None:
+    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    assert text.index("finalize_output.py") < text.index("promotion.py create")
+    routing = (SKILL_ROOT / "references" / "pr-routing.md").read_text(encoding="utf-8")
+    assert "new versioned bundle and handoff" in routing
+
+
 def test_final_output_bundle_is_mandatory_before_stop() -> None:
     text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
     lowered = text.lower()
