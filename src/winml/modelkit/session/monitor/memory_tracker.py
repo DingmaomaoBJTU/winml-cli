@@ -347,6 +347,10 @@ class ProcessMemoryTracker:
         self.availability: dict[str, dict[str, str]] = {}
         self._peaks: dict[str, float] = {}
         self._counts: dict[str, int] = {}
+        self._last_sample_at: float | None = None
+        self._sample_interval_count = 0
+        self._sample_interval_total = 0.0
+        self._sample_interval_max: float | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -434,7 +438,14 @@ class ProcessMemoryTracker:
         while not self._stop.is_set():
             during_load = self._load_active
             values, _ = self._observe()
+            sampled_at = time.monotonic()
             with self._lock:
+                if self._last_sample_at is not None:
+                    elapsed = sampled_at - self._last_sample_at
+                    self._sample_interval_count += 1
+                    self._sample_interval_total += elapsed
+                    self._sample_interval_max = max(self._sample_interval_max or 0.0, elapsed)
+                self._last_sample_at = sampled_at
                 for key, value in values.items():
                     if value is not None:
                         self._counts[key] = self._counts.get(key, 0) + 1
@@ -575,7 +586,13 @@ class ProcessMemoryTracker:
                 "pid": os.getpid(),
                 "adapter_luid": self.adapter_luid,
                 "unit": "MiB",
-                "sampling_interval_sec": self.interval,
+                "configured_poll_delay_sec": self.interval,
+                "observed_mean_interval_sec": (
+                    self._sample_interval_total / self._sample_interval_count
+                    if self._sample_interval_count
+                    else None
+                ),
+                "observed_max_interval_sec": self._sample_interval_max,
                 "duration_sec": (self._ended or time.monotonic()) - self._started,
                 "sample_count": max(self._counts.values(), default=0),
                 "rss_samples": self._counts.get("rss", 0),

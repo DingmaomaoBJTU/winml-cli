@@ -98,6 +98,34 @@ def test_sampler_tracks_temporary_peak_separately(monkeypatch):
     assert result["shared_peak_mb"] == 0 and result["shared_samples"] == 3
 
 
+def test_sampling_reports_observed_cadence_not_configured_delay(monkeypatch):
+    tracker = ProcessMemoryTracker(interval=0.05)
+    clock = iter([10.0, 10.3, 10.8])
+    monkeypatch.setattr(memory.time, "monotonic", lambda: next(clock))
+    calls = []
+
+    def observe():
+        calls.append(True)
+        if len(calls) == 3:
+            tracker._stop.set()
+        return {"rss": 100.0}, {}
+
+    monkeypatch.setattr(tracker, "_observe", observe)
+    tracker._sample()
+    tracker._ended = tracker._started + 1
+    result = tracker.sampled()
+    assert result["configured_poll_delay_sec"] == 0.05
+    assert result["observed_mean_interval_sec"] == pytest.approx(0.4)
+    assert result["observed_max_interval_sec"] == pytest.approx(0.5)
+    assert "sampling_interval_sec" not in result
+
+
+def test_sampling_without_two_observations_has_no_cadence():
+    result = ProcessMemoryTracker().sampled()
+    assert result["observed_mean_interval_sec"] is None
+    assert result["observed_max_interval_sec"] is None
+
+
 @pytest.mark.parametrize(
     "runtime,artifact",
     [

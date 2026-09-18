@@ -100,7 +100,12 @@ imports, build caches and input preparation can contribute to the measured span.
 
 `process_memory` separately records sampled RSS/local/shared peaks, actual
 sample counts, interval and duration over loading, compilation and inference.
-These are sampled peaks, not an exact continuous maximum. The legacy
+These are sampled peaks, not an exact continuous maximum. The configured
+polling delay is not a sampling frequency: `configured_poll_delay_sec` records
+the wait after each observation. `observed_mean_interval_sec` and
+`observed_max_interval_sec` record elapsed time between completed observations
+(null with fewer than two observations). GPU discovery/retries also delay RSS
+sampling; these intervals include that overhead and scheduling delays. The legacy
 `*_checkpoint_peak_mb` remains the maximum of the three original checkpoints,
 and is `null` if any required checkpoint is unavailable.
 

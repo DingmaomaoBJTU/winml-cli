@@ -5,6 +5,7 @@
 
 """Baseline device lifetime and unknown counters do not contaminate deltas."""
 
+import ctypes
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -130,6 +131,52 @@ def test_perf_releases_baseline_on_success_or_failure(monkeypatch, failure):
 def test_luid_rejected_before_native_calls():
     with pytest.raises(ValueError, match="LUID"):
         native.GpuBaselineDevice("adapter-zero")
+
+
+@pytest.mark.parametrize("failure", [None, "factory", "adapter", "device"])
+def test_native_device_releases_acquired_interfaces(monkeypatch, failure):
+    released = []
+
+    def acquire(stage, value, output):
+        if failure == stage:
+            return -2147467259
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = value
+        return 0
+
+    factory = Mock(side_effect=lambda iid, out: acquire("factory", 11, out))
+    create = Mock(side_effect=lambda adapter, level, iid, out: acquire("device", 33, out))
+    monkeypatch.setattr(
+        native.ctypes,
+        "WinDLL",
+        lambda name: (
+            SimpleNamespace(CreateDXGIFactory1=factory)
+            if name == "dxgi"
+            else SimpleNamespace(D3D12CreateDevice=create)
+        ),
+    )
+
+    def method(pointer, index, result, *args):
+        if index == 2:
+            return lambda value: released.append(value.value)
+        assert pointer.value == 11 and index == 26
+
+        def adapter_by_luid(factory, luid, iid, output):
+            assert luid.low == 2 and luid.high == -1
+            return acquire("adapter", 22, output)
+
+        return adapter_by_luid
+
+    monkeypatch.setattr(native, "_method", method)
+    if failure:
+        with pytest.raises(OSError, match="HRESULT"):
+            native.GpuBaselineDevice("0xffffffff_0x00000002")
+        assert released == {"factory": [], "adapter": [11], "device": [22, 11]}[failure]
+    else:
+        device = native.GpuBaselineDevice("0xffffffff_0x00000002")
+        assert released == [22, 11]
+        device.close()
+        device.close()
+        assert released == [22, 11, 33]
 
 
 @pytest.mark.parametrize("failure", [False, True])
