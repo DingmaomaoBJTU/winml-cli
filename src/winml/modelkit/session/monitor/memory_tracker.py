@@ -571,10 +571,10 @@ class ProcessMemoryTracker:
         result["os_rss_high_water_at_ready_mb"] = self._load_os_ready
         result["limitations"] = [
             "Sampling may miss short allocations; OS high-water is attributable only "
-            "when it increases during the load window.",
+            + "when it increases during the load window.",
             "RSS measures resident pages, not private commit or exact required capacity.",
             "GPU counters are sampled; local/shared counters may overlap on UMA "
-            "and must not be summed.",
+            + "and must not be summed.",
         ]
         return result
 
