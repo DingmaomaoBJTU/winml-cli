@@ -237,6 +237,31 @@ def test_resolve_device_does_not_load_dll() -> None:
     mock_reg.instance.assert_not_called()
 
 
+def test_resolve_device_cgc_loads_runtime_before_resolving_with_dml() -> None:
+    calls: list[object] = []
+    registry = MagicMock()
+    registry.available_eps.return_value = frozenset({"DmlExecutionProvider"})
+    registry.auto_device.side_effect = lambda target: calls.append(target)
+
+    with (
+        patch(
+            "winml.modelkit.session._runtime_import.import_runtime",
+            side_effect=lambda: calls.append("runtime"),
+        ),
+        patch(
+            "winml.modelkit.session.ep_registry.WinMLEPRegistry.instance",
+            return_value=registry,
+        ),
+    ):
+        result = resolve_device(
+            EPDeviceTarget(ep="auto", device="auto", source="pypi"),
+            backend="cgc",
+        )
+
+    assert calls == ["runtime", EPDeviceTarget(ep="DmlExecutionProvider", device="gpu")]
+    assert result == EPDeviceTarget(ep="DmlExecutionProvider", device="gpu")
+
+
 @pytest.mark.parametrize(
     "ep,device",
     [
@@ -420,7 +445,7 @@ def test_ep_device_specs_count() -> None:
     """
     from winml.modelkit.session import EP_DEVICE_SPECS
 
-    assert len(EP_DEVICE_SPECS) == 12
+    assert len(EP_DEVICE_SPECS) == 13
 
 
 def test_lookup_device_spec_qnn_npu() -> None:
@@ -733,6 +758,35 @@ def test_resolve_device_device_only_picks_registered_ep() -> None:
         "'OpenVINOExecutionProvider' (the only registered NPU EP on this stub host)."
     )
     assert result.device == "npu"
+
+
+def test_resolve_device_device_only_acquires_catalog_ep_when_none_installed() -> None:
+    """An explicit NPU request reaches Catalog-backed QNN instead of filtering it out."""
+    from winml.modelkit.session import resolve_device
+    from winml.modelkit.session.ep_registry import WinMLEPRegistry
+
+    registry = MagicMock()
+    registry.available_eps.return_value = frozenset({"CPUExecutionProvider"})
+    seen: list[EPDeviceTarget] = []
+
+    def validate_device(candidate: EPDeviceTarget) -> object:
+        seen.append(candidate)
+        if candidate.ep == "QNNExecutionProvider":
+            return object()
+        raise AssertionError(f"Unexpected candidate {candidate!r}")
+
+    registry.auto_device.side_effect = validate_device
+    with (
+        patch.object(WinMLEPRegistry, "instance", return_value=registry),
+        patch(
+            "winml.modelkit.ep_path.EPCatalog.is_compatible",
+            return_value=True,
+        ),
+    ):
+        result = resolve_device(EPDeviceTarget(ep="auto", device="npu"))
+
+    assert seen == [EPDeviceTarget(ep="QNNExecutionProvider", device="npu")]
+    assert result == EPDeviceTarget(ep="QNNExecutionProvider", device="npu")
 
 
 def test_resolve_device_ep_only_uses_runtime_bound_device() -> None:

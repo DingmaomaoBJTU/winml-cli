@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime
 import gc
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -28,8 +29,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..export import export_onnx
+from ..onnx import copy_onnx_model
 from ..utils import MANIFEST_FILENAME, ManifestStage, WinMLManifest
-from .common import run_build_stages
+from .common import StagesResult, run_build_stages
 
 
 if TYPE_CHECKING:
@@ -83,6 +85,7 @@ def build_hf_model(
     model_id: str | None = None,
     pytorch_model: nn.Module | None = None,
     rebuild: bool = False,
+    skip_build: bool = False,
     trust_remote_code: bool = False,
     random_init: bool = False,
     cache_key: str | None = None,
@@ -111,6 +114,7 @@ def build_hf_model(
         pytorch_model: Pre-loaded PyTorch model. If provided, model_id is
             only used for labeling (not loading).
         rebuild: If True, overwrite existing artifacts and re-run pipeline.
+        skip_build: Export ONNX without optimization, analysis, quantization, or compilation.
         trust_remote_code: Whether to trust remote code when loading HF models.
         cache_key: Optional prefix for artifact filenames.
         ep: Target execution provider for the analyzer (e.g., ``"qnn"``).
@@ -241,22 +245,31 @@ def build_hf_model(
     # Shared with build_onnx_model via ``common.run_build_stages``.
     # =========================================================================
     skip_optimize: bool = kwargs.pop("skip_optimize", False)
-    stages = run_build_stages(
-        current_path=export_path,
-        optimized_path=optimized_path,
-        quantized_path=quantized_path,
-        compiled_path=compiled_path,
-        final_path=final_path,
-        config=config,
-        config_path=config_path,
-        ep=ep,
-        device=device,
-        hack_max_optim_iterations=hack_max_optim_iterations,
-        skip_optimize=skip_optimize or config.skip_optimize,
-        allow_unsupported_nodes=allow_unsupported_nodes,
-        analyze_result_path=output_dir / _name("analyze_result.json"),
-        onnx_kwargs=onnx_kwargs,
-    )
+    if skip_build:
+        copy_onnx_model(export_path, final_path)
+        config_path.write_text(json.dumps(config.to_dict(), indent=2))
+        stages = StagesResult(
+            current_path=final_path,
+            is_pre_quantized=False,
+            stages_skipped=["optimize", "quantize", "compile"],
+        )
+    else:
+        stages = run_build_stages(
+            current_path=export_path,
+            optimized_path=optimized_path,
+            quantized_path=quantized_path,
+            compiled_path=compiled_path,
+            final_path=final_path,
+            config=config,
+            config_path=config_path,
+            ep=ep,
+            device=device,
+            hack_max_optim_iterations=hack_max_optim_iterations,
+            skip_optimize=skip_optimize or config.skip_optimize,
+            allow_unsupported_nodes=allow_unsupported_nodes,
+            analyze_result_path=output_dir / _name("analyze_result.json"),
+            onnx_kwargs=onnx_kwargs,
+        )
     stages_completed.extend(stages.stages_completed)
     stages_skipped.extend(stages.stages_skipped)
     stage_timings.update(stages.stage_timings)
@@ -350,6 +363,9 @@ def _load_model(
             path (PR #719 dedup pattern).
     """
     task = config.loader.task
+    attn_implementation = (
+        config.export.compatibility.transformers_attention if config.export else None
+    )
 
     if random_init:
         from transformers import AutoConfig
@@ -402,7 +418,10 @@ def _load_model(
 
         model_label = model_id or config.loader.model_type
         logger.info("Creating random-weight model: %s (from %s)", model_class.__name__, model_label)
-        return model_class.from_config(hf_config)
+        model_kwargs: dict[str, Any] = {}
+        if attn_implementation is not None:
+            model_kwargs["attn_implementation"] = attn_implementation
+        return model_class.from_config(hf_config, **model_kwargs)
 
     if model_id is not None:
         from ..loader import load_hf_model
@@ -415,6 +434,7 @@ def _load_model(
             trust_remote_code=effective_trust,
             hf_config=hf_config,
             model_type=model_type,
+            attn_implementation=attn_implementation,
         )
         return pytorch_model
 

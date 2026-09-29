@@ -10,16 +10,91 @@ import logging
 import os
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
+
+from onnx import checker as onnx_checker
 
 from .base import BaseQuantPass
 
 
 if TYPE_CHECKING:
+    from onnx import GraphProto
+
     from ..config import QuantizeResult, WinMLQuantizationConfig
 
 
 logger = logging.getLogger(__name__)
+
+
+def _restore_external_initializers(original: GraphProto, converted: GraphProto) -> None:
+    """Restore external weights within their graph and nested attribute scopes."""
+    from onnx import external_data_helper
+
+    external_initializers = {
+        tensor.name: tensor
+        for tensor in original.initializer
+        if external_data_helper.uses_external_data(tensor)
+    }
+    for tensor in converted.initializer:
+        source = external_initializers.get(tensor.name)
+        if source is not None:
+            if tensor.data_type != source.data_type or tensor.dims != source.dims:
+                raise ValueError(f"Opset conversion changed external initializer {tensor.name!r}")
+            tensor.CopyFrom(source)
+
+    subgraphs = {
+        (tuple(node.output), attribute.name): attribute
+        for node in original.node
+        for attribute in node.attribute
+        if attribute.HasField("g") or attribute.graphs
+    }
+    for node in converted.node:
+        for attribute in node.attribute:
+            source_attribute = subgraphs.get((tuple(node.output), attribute.name))
+            if source_attribute is None:
+                continue
+            if attribute.HasField("g"):
+                _restore_external_initializers(source_attribute.g, attribute.g)
+            for source_graph, converted_graph in zip(
+                source_attribute.graphs, attribute.graphs, strict=True
+            ):
+                _restore_external_initializers(source_graph, converted_graph)
+
+
+def _publish_staged_model(staged_path: Path, output_path: Path) -> None:
+    """Publish a validated staged ONNX model while preserving prior output on failure."""
+    staged_sidecar = staged_path.parent / f"{staged_path.name}.data"
+    output_sidecar = output_path.parent / f"{output_path.name}.data"
+    for label, path in (("Output path", output_path), ("Output sidecar path", output_sidecar)):
+        if os.path.lexists(path) and not path.is_file():
+            raise ValueError(f"{label} exists but is not a file: {path}")
+
+    with TemporaryDirectory(prefix=".publish-backup-", dir=staged_path.parent) as backup_directory:
+        backup_model = Path(backup_directory) / "model"
+        backup_sidecar = Path(backup_directory) / "sidecar"
+        backed_up_model = False
+        backed_up_sidecar = False
+        published_sidecar = False
+        try:
+            if output_path.exists():
+                output_path.replace(backup_model)
+                backed_up_model = True
+            if output_sidecar.exists():
+                output_sidecar.replace(backup_sidecar)
+                backed_up_sidecar = True
+            if staged_sidecar.exists():
+                staged_sidecar.replace(output_sidecar)
+                published_sidecar = True
+            staged_path.replace(output_path)
+        except BaseException:
+            if published_sidecar:
+                output_sidecar.unlink(missing_ok=True)
+            if backed_up_sidecar:
+                backup_sidecar.replace(output_sidecar)
+            if backed_up_model:
+                backup_model.replace(output_path)
+            raise
 
 
 class StaticPass(BaseQuantPass):
@@ -49,6 +124,7 @@ class StaticPass(BaseQuantPass):
         use_external_data: bool = True,
     ) -> QuantizeResult:
         """Apply QDQ calibrated quantization to *model_path*."""
+        from onnx import external_data_helper, load_model, version_converter
         from onnxruntime.quantization import (
             CalibrationMethod,
             QuantType,
@@ -123,9 +199,29 @@ class StaticPass(BaseQuantPass):
             ),
         }
 
+        from onnxruntime.quantization.quant_utils import add_pre_process_metadata
+
+        from ...onnx import capture_metadata, load_onnx, restore_metadata, save_onnx
+        from ..qdq_fix import fix_qdq_dtype_info
+
+        input_model = load_model(model_path, load_external_data=False)
+        metadata_snapshot = capture_metadata(input_model)
+        onnx_opset = next(
+            opset.version for opset in input_model.opset_import if opset.domain in ("", "ai.onnx")
+        )
+        if onnx_opset < 21 and (
+            self._config.weight_type in ("uint16", "int16")
+            or self._config.activation_type in ("uint16", "int16")
+        ):
+            logger.info("Converting QDQ input to opset 21 before loading external weights...")
+            converted_model = version_converter.convert_version(input_model, 21)
+            _restore_external_initializers(input_model.graph, converted_model.graph)
+            input_model = converted_model
+        add_pre_process_metadata(input_model)
+
         logger.info("Generating QDQ config...")
         qdq_config = get_qdq_config(
-            model_input=str(model_path),
+            model_input=input_model,
             calibration_data_reader=data_reader,
             weight_type=weight_type,
             activation_type=activation_type,
@@ -136,64 +232,60 @@ class StaticPass(BaseQuantPass):
             extra_options=extra_options,
         )
 
-        from onnxruntime.quantization.quant_utils import add_pre_process_metadata
-
-        from ...onnx import capture_metadata, load_onnx, restore_metadata, save_onnx
-        from ..qdq_fix import fix_qdq_dtype_info
-
-        input_model = load_onnx(model_path, validate=False)
-        metadata_snapshot = capture_metadata(input_model)
-        add_pre_process_metadata(input_model)
+        external_data_helper.load_external_data_for_model(input_model, str(model_path.parent))
 
         if use_external_data:
             qdq_config.use_external_data_format = True
         logger.info("Applying quantization...")
-        abs_model_output = str(Path(output_path).resolve())
-        if output_path.exists():
-            output_path.unlink()
-        stale_sidecar = output_path.parent / f"{output_path.name}.data"
-        if stale_sidecar.exists():
-            stale_sidecar.unlink()
-        original_cwd = Path.cwd()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chdir(output_path.parent)
-            quantize(
-                model_input=input_model,
-                model_output=abs_model_output,
-                quant_config=qdq_config,
+        with TemporaryDirectory(
+            prefix=f".{output_path.stem}-",
+            dir=output_path.parent,
+        ) as staging_directory:
+            staged_output = (Path(staging_directory) / output_path.name).resolve()
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(staged_output.parent)
+                quantize(
+                    model_input=input_model,
+                    model_output=str(staged_output.resolve()),
+                    quant_config=qdq_config,
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            qdq_time = time.perf_counter() - qdq_start
+            postproc_start = time.perf_counter()
+            quantized_model = load_onnx(staged_output, validate=False)
+
+            logger.info("Fixing QDQ node dtype info...")
+            fix_result = fix_qdq_dtype_info(quantized_model)
+            warnings.extend(fix_result.warnings)
+
+            from ...onnx import infer_shapes
+
+            logger.info("Running shape inference on quantized model...")
+            quantized_model = infer_shapes(quantized_model)
+
+            if metadata_snapshot.model_prop_count > 0 or metadata_snapshot.node_count > 0:
+                logger.info("Restoring metadata from pre-quantization model...")
+                restore_metadata(quantized_model, metadata_snapshot)
+
+            from ..hints import canonicalize_quantization_region_hints
+
+            logger.info("Applying optimizer quantization-region hints...")
+            quantized_model = canonicalize_quantization_region_hints(quantized_model)
+
+            from ...compiler import QDQ_OP_TYPES
+
+            nodes_quantized = sum(
+                1 for node in quantized_model.graph.node if node.op_type in QDQ_OP_TYPES
             )
-        finally:
-            os.chdir(original_cwd)
+            save_onnx(quantized_model, staged_output, use_external_data=use_external_data)
 
-        qdq_time = time.perf_counter() - qdq_start
-
-        postproc_start = time.perf_counter()
-
-        quantized_model = load_onnx(output_path, validate=False)
-
-        logger.info("Fixing QDQ node dtype info...")
-        fix_result = fix_qdq_dtype_info(quantized_model)
-        warnings.extend(fix_result.warnings)
-
-        from ...onnx import infer_shapes
-
-        logger.info("Running shape inference on quantized model...")
-        quantized_model = infer_shapes(quantized_model)
-
-        if metadata_snapshot.node_count > 0:
-            logger.info("Restoring metadata from pre-quantization model...")
-            restore_metadata(quantized_model, metadata_snapshot)
-
-        postproc_time = time.perf_counter() - postproc_start
-
-        from ...compiler import QDQ_OP_TYPES
-
-        nodes_quantized = sum(
-            1 for node in quantized_model.graph.node if node.op_type in QDQ_OP_TYPES
-        )
-
-        save_onnx(quantized_model, output_path, use_external_data=use_external_data)
+            onnx_checker.check_model(str(staged_output), full_check=True)
+            _publish_staged_model(staged_output, output_path)
+            postproc_time = time.perf_counter() - postproc_start
 
         total_time = time.perf_counter() - start_time
 

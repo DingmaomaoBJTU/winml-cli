@@ -6,21 +6,29 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import pytest
 from google.protobuf.message import EncodeError
+from onnx import ModelProto, TensorProto, checker, helper, load, numpy_helper, save
 
+from winml.modelkit.optim.pipes import SurgeryPipe, SurgeryPipeConfig
 from winml.modelkit.quant import WinMLQuantizationConfig
 from winml.modelkit.quant.config import QuantizeResult
 from winml.modelkit.quant.fp16 import convert_to_fp16
+from winml.modelkit.quant.hints import QUANTIZATION_REGION_HINT_KEY, QuantizationHintError
 from winml.modelkit.quant.passes import BaseQuantPass, DynamicPass, FP16Pass, RTNPass, StaticPass
+from winml.modelkit.quant.passes.static import _publish_staged_model
 
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from onnx import GraphProto
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +353,7 @@ class TestFP16Conversion:
     ) -> None:
         """Large external-data models can exceed protobuf's in-memory serialize limit."""
         calls: list[dict] = []
-        model = SimpleNamespace(graph=SimpleNamespace(initializer=[], node=[]))
+        model = ModelProto()
 
         def fake_convert(model_arg, **kwargs):
             calls.append(kwargs)
@@ -641,3 +649,453 @@ class TestDynamicConfigSerialization:
     def test_reduce_range_omitted_for_non_dynamic_modes(self) -> None:
         config = WinMLQuantizationConfig(mode="static", reduce_range=True)
         assert "reduce_range" not in config.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# StaticPass — optimizer quantization-region hint integration
+# ---------------------------------------------------------------------------
+
+
+def _make_static_grouped_conv_model() -> ModelProto:
+    weights = numpy_helper.from_array(
+        np.random.RandomState(0).randn(4, 2, 8).astype(np.float32),
+        "weights",
+    )
+    slice_values = [
+        numpy_helper.from_array(np.array([value], dtype=np.int64), name)
+        for name, value in (("starts", 0), ("ends", -1), ("axes", 2), ("steps", 1))
+    ]
+    conv = helper.make_node(
+        "Conv",
+        ["input", "weights"],
+        ["conv_output"],
+        name="grouped_conv",
+        group=2,
+        kernel_shape=[8],
+        pads=[4, 4],
+        strides=[1],
+        dilations=[1],
+    )
+    tail_slice = helper.make_node(
+        "Slice",
+        ["conv_output", "starts", "ends", "axes", "steps"],
+        ["output"],
+        name="tail_slice",
+    )
+    graph = helper.make_graph(
+        [conv, tail_slice],
+        "static_grouped_conv",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 3])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 3])],
+        initializer=[weights, *slice_values],
+    )
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+
+
+class TestPublishStagedModel:
+    @pytest.mark.parametrize("output_name", ["previous-output.onnx", "previous-output.onnx.data"])
+    def test_backup_paths_do_not_alias_staged_artifacts(
+        self,
+        tmp_path: Path,
+        output_name: str,
+    ) -> None:
+        staging_directory = tmp_path / "staging"
+        output_directory = tmp_path / "output"
+        staging_directory.mkdir()
+        output_directory.mkdir()
+        staged_path = staging_directory / output_name
+        staged_sidecar = staging_directory / f"{output_name}.data"
+        output_path = output_directory / output_name
+        output_sidecar = output_directory / f"{output_name}.data"
+        staged_path.write_bytes(b"new-model")
+        staged_sidecar.write_bytes(b"new-sidecar")
+        output_path.write_bytes(b"old-model")
+        output_sidecar.write_bytes(b"old-sidecar")
+
+        _publish_staged_model(staged_path, output_path)
+
+        assert output_path.read_bytes() == b"new-model"
+        assert output_sidecar.read_bytes() == b"new-sidecar"
+
+    @pytest.mark.parametrize(
+        ("directory_target", "message"),
+        [
+            ("model", "Output path exists but is not a file"),
+            ("sidecar", "Output sidecar path exists but is not a file"),
+        ],
+    )
+    def test_rejects_directory_destinations_without_mutation(
+        self,
+        tmp_path: Path,
+        directory_target: str,
+        message: str,
+    ) -> None:
+        staging_directory = tmp_path / "staging"
+        output_directory = tmp_path / "output"
+        staging_directory.mkdir()
+        output_directory.mkdir()
+        staged_path = staging_directory / "quantized.onnx"
+        staged_sidecar = staging_directory / "quantized.onnx.data"
+        output_path = output_directory / "quantized.onnx"
+        output_sidecar = output_directory / "quantized.onnx.data"
+        staged_path.write_bytes(b"new-model")
+        staged_sidecar.write_bytes(b"new-sidecar")
+        directory_path = output_path if directory_target == "model" else output_sidecar
+        file_path = output_sidecar if directory_target == "model" else output_path
+        directory_path.mkdir()
+        sentinel = directory_path / "keep.bin"
+        sentinel.write_bytes(b"keep")
+        file_path.write_bytes(b"old-file")
+
+        with pytest.raises(ValueError, match=message):
+            _publish_staged_model(staged_path, output_path)
+
+        assert directory_path.is_dir()
+        assert sentinel.read_bytes() == b"keep"
+        assert file_path.read_bytes() == b"old-file"
+        assert staged_path.read_bytes() == b"new-model"
+        assert staged_sidecar.read_bytes() == b"new-sidecar"
+
+
+class TestStaticPassQuantizationRegionHints:
+    def test_external_16bit_opset_conversion_precedes_weight_loading(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from onnx import external_data_helper, version_converter
+        from onnxruntime.quantization import CalibrationDataReader
+
+        class Reader(CalibrationDataReader):
+            def get_next(self) -> dict[str, np.ndarray] | None:
+                return next(self._iterator, None)
+
+            def __init__(self) -> None:
+                self._iterator = iter(
+                    [{"input": np.random.RandomState(7).randn(1, 4, 3).astype(np.float32)}]
+                )
+
+        model_path = tmp_path / "input.onnx"
+        output_path = tmp_path / "quantized.onnx"
+        save(
+            _make_static_grouped_conv_model(),
+            model_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="input.onnx.data",
+            size_threshold=128,
+        )
+        convert_version = version_converter.convert_version
+        conversions = []
+
+        def convert_compact_model(model: ModelProto, target_version: int) -> ModelProto:
+            external_weights = [
+                tensor
+                for tensor in model.graph.initializer
+                if external_data_helper.uses_external_data(tensor)
+            ]
+            assert external_weights
+            assert all(not tensor.HasField("raw_data") for tensor in external_weights)
+            conversions.append(target_version)
+            return convert_version(model, target_version)
+
+        monkeypatch.setattr(version_converter, "convert_version", convert_compact_model)
+        result = StaticPass(
+            WinMLQuantizationConfig(
+                mode="static",
+                calibration_data=Reader(),
+                activation_type="uint16",
+                weight_type="uint8",
+                per_channel=False,
+            )
+        ).run(model_path, output_path)
+
+        assert result.success
+        assert conversions == [21]
+        checker.check_model(str(output_path), full_check=True)
+        quantized = load(output_path)
+        qdq_nodes = [
+            node for node in quantized.graph.node
+            if node.op_type in {"QuantizeLinear", "DequantizeLinear"}
+        ]
+        assert qdq_nodes
+        assert all(node.domain == "" for node in qdq_nodes)
+
+    @pytest.mark.parametrize("depth", [1, 2])
+    def test_external_subgraph_weights_preserve_scope(
+        self,
+        tmp_path: Path,
+        depth: int,
+    ) -> None:
+        from onnxruntime import InferenceSession
+        from onnxruntime.quantization import CalibrationDataReader
+
+        generator = np.random.default_rng(7)
+
+        def make_branch(level: int) -> GraphProto:
+            weights = numpy_helper.from_array(
+                generator.normal(size=(2, 2)).astype(np.float32), "weight"
+            )
+            nodes = [
+                helper.make_node(
+                    "MatMul", ["input", "weight"],
+                    ["product" if level > 1 else "branch_output"],
+                )
+            ]
+            if level > 1:
+                nodes.extend([
+                    helper.make_node(
+                        "If", ["condition"], ["nested_output"],
+                        then_branch=make_branch(level - 1),
+                        else_branch=make_branch(level - 1),
+                    ),
+                    helper.make_node("Add", ["product", "nested_output"], ["branch_output"]),
+                ])
+            return helper.make_graph(
+                nodes, "branch", [],
+                [helper.make_tensor_value_info("branch_output", TensorProto.FLOAT, [1, 2])],
+                [weights],
+            )
+
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["input", "weight"], ["aux_output"]),
+                helper.make_node(
+                    "If", ["condition"], ["output"],
+                    then_branch=make_branch(depth), else_branch=make_branch(depth),
+                ),
+            ],
+            "external_subgraphs",
+            [
+                helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2]),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+            ],
+            [
+                helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2]),
+                helper.make_tensor_value_info("aux_output", TensorProto.FLOAT, [1, 2]),
+            ],
+            [numpy_helper.from_array(generator.normal(size=(2, 2)).astype(np.float32), "weight")],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+        model_path = tmp_path / "input.onnx"
+        output_path = tmp_path / "quantized.onnx"
+        save(
+            model, model_path, save_as_external_data=True,
+            all_tensors_to_one_file=True, location="input.onnx.data", size_threshold=0,
+        )
+        checker.check_model(str(model_path), full_check=True)
+        samples = [
+            {"input": np.ones((1, 2), dtype=np.float32), "condition": np.array(condition)}
+            for condition in (True, False)
+        ]
+
+        class Reader(CalibrationDataReader):
+            def __init__(self) -> None:
+                self._iterator = iter(samples)
+
+            def get_next(self) -> dict[str, np.ndarray] | None:
+                return next(self._iterator, None)
+
+        result = StaticPass(
+            WinMLQuantizationConfig(
+                mode="static", calibration_data=Reader(),
+                activation_type="uint16", weight_type="uint8", per_channel=False,
+            )
+        ).run(model_path, output_path)
+
+        assert result.success
+        checker.check_model(str(output_path), full_check=True)
+
+        def subgraph_weights(graph: GraphProto) -> list[np.ndarray]:
+            weights = []
+            for node in graph.node:
+                for attribute in sorted(node.attribute, key=lambda attribute: attribute.name):
+                    if attribute.HasField("g"):
+                        weights.extend(
+                            numpy_helper.to_array(tensor) for tensor in attribute.g.initializer
+                        )
+                        weights.extend(subgraph_weights(attribute.g))
+            return weights
+
+        original_weights = subgraph_weights(load(model_path).graph)
+        restored_weights = subgraph_weights(load(output_path).graph)
+        assert original_weights
+        for original_weight, restored_weight in zip(
+            original_weights, restored_weights, strict=True
+        ):
+            np.testing.assert_array_equal(restored_weight, original_weight)
+        quantized = InferenceSession(str(output_path), providers=["CPUExecutionProvider"])
+        for sample in samples:
+            output = quantized.run(["output"], sample)[0]
+            assert output.shape == sample["input"].shape
+            assert np.isfinite(output).all()
+
+    def test_restores_model_only_hint_and_canonicalizes_branch_outputs(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from onnxruntime.quantization import CalibrationDataReader
+
+        from winml.modelkit.onnx import capture_metadata
+
+        class Reader(CalibrationDataReader):
+            def __init__(self) -> None:
+                self.rewind()
+
+            def get_next(self) -> dict[str, np.ndarray] | None:
+                return next(self._iterator, None)
+
+            def rewind(self) -> None:
+                self._iterator = iter(
+                    [{"input": np.random.RandomState(7).randn(1, 4, 3).astype(np.float32)}]
+                )
+
+        optimized = SurgeryPipe().process(
+            _make_static_grouped_conv_model(),
+            SurgeryPipeConfig(trim_split_grouped_conv=True),
+        )
+        optimized.metadata_props.add(key="keep.me", value="restored")
+        snapshot = capture_metadata(optimized)
+        assert snapshot.node_count == 0
+        assert snapshot.model_prop_count == 2
+        hint = json.loads(
+            next(
+                item.value
+                for item in optimized.metadata_props
+                if item.key == QUANTIZATION_REGION_HINT_KEY
+            )
+        )
+        branch_names = hint["regions"][0]["branches"]
+        concat_name = hint["regions"][0]["concat"]
+
+        model_path = tmp_path / "optimized.onnx"
+        output_path = tmp_path / "quantized.onnx"
+        save(optimized, model_path)
+        result = StaticPass(
+            WinMLQuantizationConfig(
+                mode="static",
+                samples=1,
+                calibration_data=Reader(),
+                activation_type="uint8",
+                weight_type="uint8",
+                per_channel=False,
+            )
+        ).run(model_path, output_path, use_external_data=False)
+
+        assert result.success
+        quantized = load(output_path)
+        checker.check_model(quantized, full_check=True)
+        metadata = {item.key: item.value for item in quantized.metadata_props}
+        assert metadata["keep.me"] == "restored"
+        assert QUANTIZATION_REGION_HINT_KEY not in metadata
+        nodes = {node.name: node for node in quantized.graph.node}
+        concat = nodes[concat_name]
+        assert list(concat.input) == [nodes[name].output[0] for name in branch_names]
+
+    def test_accepts_hints_when_generated_convs_are_not_quantized(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from onnxruntime.quantization import CalibrationDataReader
+
+        class Reader(CalibrationDataReader):
+            def __init__(self) -> None:
+                self.rewind()
+
+            def get_next(self) -> dict[str, np.ndarray] | None:
+                return next(self._iterator, None)
+
+            def rewind(self) -> None:
+                self._iterator = iter(
+                    [{"input": np.random.RandomState(7).randn(1, 4, 3).astype(np.float32)}]
+                )
+
+        optimized = SurgeryPipe().process(
+            _make_static_grouped_conv_model(),
+            SurgeryPipeConfig(trim_split_grouped_conv=True),
+        )
+        hint = json.loads(
+            next(
+                item.value
+                for item in optimized.metadata_props
+                if item.key == QUANTIZATION_REGION_HINT_KEY
+            )
+        )
+        branch_names = hint["regions"][0]["branches"]
+        concat_name = hint["regions"][0]["concat"]
+        model_path = tmp_path / "optimized.onnx"
+        output_path = tmp_path / "quantized.onnx"
+        save(optimized, model_path)
+        config = WinMLQuantizationConfig(
+            mode="static",
+            samples=1,
+            calibration_data=Reader(),
+            activation_type="uint8",
+            weight_type="uint8",
+            per_channel=False,
+            op_types_to_quantize=["MatMul"],
+        )
+
+        result = StaticPass(config).run(model_path, output_path, use_external_data=False)
+
+        assert result.success
+        quantized = load(output_path)
+        checker.check_model(quantized, full_check=True)
+        metadata = {item.key: item.value for item in quantized.metadata_props}
+        assert QUANTIZATION_REGION_HINT_KEY not in metadata
+        nodes = {node.name: node for node in quantized.graph.node}
+        concat = nodes[concat_name]
+        assert list(concat.input) == [nodes[name].output[0] for name in branch_names]
+
+    def test_postprocessing_failure_preserves_existing_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from onnxruntime.quantization import CalibrationDataReader
+
+        class Reader(CalibrationDataReader):
+            def __init__(self) -> None:
+                self.rewind()
+
+            def get_next(self) -> dict[str, np.ndarray] | None:
+                return next(self._iterator, None)
+
+            def rewind(self) -> None:
+                self._iterator = iter(
+                    [{"input": np.random.RandomState(7).randn(1, 4, 3).astype(np.float32)}]
+                )
+
+        optimized = SurgeryPipe().process(
+            _make_static_grouped_conv_model(),
+            SurgeryPipeConfig(trim_split_grouped_conv=True),
+        )
+        model_path = tmp_path / "optimized.onnx"
+        output_path = tmp_path / "quantized.onnx"
+        sidecar_path = tmp_path / "quantized.onnx.data"
+        save(optimized, model_path)
+        output_path.write_bytes(b"previous-output")
+        sidecar_path.write_bytes(b"previous-sidecar")
+
+        def fail_postprocessing(_model: ModelProto) -> ModelProto:
+            raise QuantizationHintError("stale hint")
+
+        monkeypatch.setattr(
+            "winml.modelkit.quant.hints.canonicalize_quantization_region_hints",
+            fail_postprocessing,
+        )
+
+        with pytest.raises(QuantizationHintError, match="stale hint"):
+            StaticPass(
+                WinMLQuantizationConfig(
+                    mode="static",
+                    samples=1,
+                    calibration_data=Reader(),
+                    activation_type="uint8",
+                    weight_type="uint8",
+                    per_channel=False,
+                )
+            ).run(model_path, output_path, use_external_data=False)
+
+        assert output_path.read_bytes() == b"previous-output"
+        assert sidecar_path.read_bytes() == b"previous-sidecar"

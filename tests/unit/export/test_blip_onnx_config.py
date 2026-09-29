@@ -136,7 +136,7 @@ class TestBlipDecoderIO:
         assert tuple(inputs["past_0_key"].shape) == expected
         assert tuple(inputs["past_0_value"].shape) == expected
 
-    def test_decoder_passes_four_dimensional_additive_attention_mask(self, monkeypatch) -> None:
+    def test_decoder_passes_three_dimensional_attention_mask(self, monkeypatch) -> None:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
@@ -165,10 +165,82 @@ class TestBlipDecoderIO:
         wrapper._invoke_hf(object(), inputs)
 
         mask = captured["attention_mask"]
-        assert mask.shape == (1, 1, 1, 2)
-        assert mask.is_floating_point()
-        assert mask[0, 0, 0, 0] == 0
-        assert mask[0, 0, 0, 1] == torch.finfo(mask.dtype).min
+        assert mask.shape == (1, 1, 2)
+        assert mask.dtype == torch.int64
+        torch.testing.assert_close(mask, inputs["decoder_attention_mask"].unsqueeze(1))
+
+    def test_decoder_preserves_three_dimensional_attention_mask(self, monkeypatch) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from winml.modelkit.models.hf import blip as blip_module
+
+        wrapper = blip_module.BlipDecoderWrapper()
+        wrapper.model = MagicMock()
+        captured: dict[str, torch.Tensor] = {}
+
+        def decode(**kwargs):
+            captured["attention_mask"] = kwargs["attention_mask"]
+            return SimpleNamespace(logits=torch.zeros((1, 1, 4)))
+
+        wrapper.model.text_decoder.side_effect = decode
+        monkeypatch.setattr(blip_module, "EncoderDecoderCache", lambda *_args: object())
+        monkeypatch.setattr(blip_module, "DynamicCache", object)
+        inputs = {
+            "decoder_input_ids": torch.zeros((1, 1), dtype=torch.int32),
+            "decoder_attention_mask": torch.tensor([[[1, 0]]], dtype=torch.int64),
+            "encoder_hidden_states": torch.zeros((1, 3, 4)),
+            "cache_position": torch.zeros((1,), dtype=torch.int64),
+        }
+
+        wrapper._invoke_hf(object(), inputs)
+
+        mask = captured["attention_mask"]
+        assert mask.shape == (1, 1, 2)
+        assert mask.dtype == torch.int64
+        torch.testing.assert_close(mask, inputs["decoder_attention_mask"])
+
+    @pytest.mark.parametrize("mask_rank", [2, 3])
+    def test_decoder_runs_with_real_model_and_binary_mask(self, blip_config, mask_rank) -> None:
+        import torch
+        from transformers import BlipForConditionalGeneration
+
+        from winml.modelkit.models.hf import blip as blip_module
+
+        wrapper = blip_module.BlipDecoderWrapper()
+        wrapper.model = BlipForConditionalGeneration(blip_config)
+        wrapper.config = blip_config
+        wrapper.onnx_config = blip_module.BlipDecoderIOConfig(
+            blip_config,
+            task="text2text-generation",
+        )
+        wrapper.num_layers = blip_config.text_config.num_hidden_layers
+        wrapper.eval()
+
+        inputs = generate_dummy_inputs("blip", "text2text-generation", blip_config)
+        inputs["cache_position"] = torch.tensor([1], dtype=torch.int64)
+        inputs["decoder_attention_mask"].zero_()
+        inputs["decoder_attention_mask"][:, :2] = 1
+        if mask_rank == 3:
+            inputs["decoder_attention_mask"] = inputs["decoder_attention_mask"].unsqueeze(1)
+
+        with torch.inference_mode():
+            logits, *present = wrapper(*wrapper.get_export_args(inputs))
+
+        text_config = blip_config.text_config
+        expected_kv_shape = (
+            1,
+            text_config.num_attention_heads,
+            1,
+            text_config.hidden_size // text_config.num_attention_heads,
+        )
+        assert logits.shape == (1, 1, text_config.vocab_size)
+        assert len(present) == 2 * text_config.num_hidden_layers
+        assert all(tuple(tensor.shape) == expected_kv_shape for tensor in present)
+        assert torch.isfinite(logits).all()
+        assert all(torch.isfinite(tensor).all() for tensor in present)
 
     def test_decoder_cache_uses_position_input_when_model_omits_cache_kwargs(
         self, blip_config

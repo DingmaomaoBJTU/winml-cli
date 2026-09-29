@@ -40,6 +40,7 @@ import onnx
 import pytest
 from click.testing import CliRunner
 
+from tests.e2e.dml_adapter import perf_test_luid, physical_dml_test_luid
 from tests.e2e.require_ep import require_device, require_ep
 from winml.modelkit.commands.perf import perf
 from winml.modelkit.utils.constants import EP_ALIASES
@@ -129,6 +130,7 @@ def _build_perf_args(
     input_data: Path | None = None,
     op_tracing: str | None = None,
     duration_overwrite: float | None = None,
+    use_test_gpu: bool = True,
 ) -> list[str]:
     """Build the argv list passed to the perf CLI.
 
@@ -172,6 +174,10 @@ def _build_perf_args(
         args += ["--op-tracing", op_tracing]
     if duration_overwrite is not None:
         args += ["--duration", str(duration_overwrite)]
+    if use_test_gpu:
+        luid = perf_test_luid(ep, device)
+        if luid is not None:
+            args += ["--device-luid", luid]
     return args
 
 
@@ -189,6 +195,15 @@ def _run_winml_cli_subprocess(
         text=True,
         timeout=timeout,
         check=False,
+    )
+
+
+def _run_perf_cli(args: list[str]) -> None:
+    """Run an EP benchmark through the real CLI and require a clean process exit."""
+    # Isolate CLI calls: loading VitisAI can prevent MIGraphX loading in the same process.
+    result = _run_winml_cli_subprocess(["perf", *args], timeout=2400)
+    assert result.returncode == 0, (
+        f"perf failed (exit {result.returncode}):\n{result.stdout}\n{result.stderr}"
     )
 
 
@@ -381,7 +396,7 @@ class _PerfBenchmarkSuite:
 
         # Console output should contain Memory section
         assert "Memory:" in result.output
-        assert "RAM:" in result.output
+        assert "RAM (RSS):" in result.output
 
     def test_benchmark_cpu_no_memory(self, tmp_path: Path, model_arg: str):
         """Benchmark with --no-memory omits memory profile from JSON output."""
@@ -557,14 +572,7 @@ class _PerfBenchmarkSuite:
 
         output_file = tmp_path / f"perf_{ep}.json"
 
-        runner = CliRunner()
-        result = runner.invoke(
-            perf,
-            _build_perf_args(model_arg=model_arg, output_file=output_file, ep=ep),
-            obj={},
-            catch_exceptions=False,
-        )
-        assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
+        _run_perf_cli(_build_perf_args(model_arg=model_arg, output_file=output_file, ep=ep))
 
         assert output_file.exists()
         data = json.loads(output_file.read_text())
@@ -582,16 +590,11 @@ class _PerfBenchmarkSuite:
 
         output_file = tmp_path / f"perf_{ep}_cpu.json"
 
-        runner = CliRunner()
-        result = runner.invoke(
-            perf,
+        _run_perf_cli(
             _build_perf_args(
                 model_arg=model_arg, output_file=output_file, device="cpu", ep=ep, monitor=True
-            ),
-            obj={},
-            catch_exceptions=False,
+            )
         )
-        assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
 
         assert output_file.exists()
         data = json.loads(output_file.read_text())
@@ -608,9 +611,7 @@ class _PerfBenchmarkSuite:
 
         output_file = tmp_path / f"perf_{ep}_gpu.json"
 
-        runner = CliRunner()
-        result = runner.invoke(
-            perf,
+        _run_perf_cli(
             _build_perf_args(
                 model_arg=gpu_model_arg,
                 output_file=output_file,
@@ -618,11 +619,8 @@ class _PerfBenchmarkSuite:
                 ep=ep,
                 monitor=True,
                 duration_overwrite=3,
-            ),
-            obj={},
-            catch_exceptions=False,
+            )
         )
-        assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
 
         assert output_file.exists()
         data = json.loads(output_file.read_text())
@@ -645,16 +643,11 @@ class _PerfBenchmarkSuite:
 
         output_file = tmp_path / f"perf_{ep}_npu.json"
 
-        runner = CliRunner()
-        result = runner.invoke(
-            perf,
+        _run_perf_cli(
             _build_perf_args(
                 model_arg=npu_model_arg, output_file=output_file, device="npu", ep=ep, monitor=True
-            ),
-            obj={},
-            catch_exceptions=False,
+            )
         )
-        assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
 
         assert output_file.exists()
         data = json.loads(output_file.read_text())
@@ -668,6 +661,137 @@ class _PerfBenchmarkSuite:
 
 class TestPerfONNXDirect(_PerfBenchmarkSuite):
     """Benchmark a pre-exported ONNX file directly via WinMLSession."""
+
+    def test_dml_provider_binding_survives_session_creation(self, onnx_model_path: Path) -> None:
+        require_ep("dml", device="gpu")
+        from winml.modelkit.commands.perf import _get_ep_device_binding
+        from winml.modelkit.session import EPDeviceTarget, WinMLEPRegistry, WinMLSession
+        from winml.modelkit.sysinfo import get_ep_device_luid
+
+        selected = WinMLEPRegistry.instance().auto_device(EPDeviceTarget(ep="dml", device="gpu"))
+        test_luid = physical_dml_test_luid(selected)
+        if test_luid is not None:
+            selected = WinMLEPRegistry.instance().auto_device(
+                EPDeviceTarget(ep="dml", device="gpu"), device_luid=test_luid
+            )
+        for device in selected.ep.devices:
+            if device.device_type != "GPU":
+                continue
+            expected_luid = get_ep_device_luid(device.ort_handle)
+            if test_luid is not None and expected_luid != test_luid:
+                continue
+            options = dict(device.ort_handle.ep_options)
+            before = [
+                (get_ep_device_luid(d.ort_handle), dict(d.ort_handle.ep_options))
+                for d in selected.ep.devices
+            ]
+            assert _get_ep_device_binding(selected, options) == (expected_luid, "gpu")
+            session = WinMLSession(
+                onnx_path=onnx_model_path, ep_device=selected, provider_options=options
+            )
+            try:
+                after = [
+                    (get_ep_device_luid(d.ort_handle), dict(d.ort_handle.ep_options))
+                    for d in selected.ep.devices
+                ]
+                assert _get_ep_device_binding(selected, options) == (expected_luid, "gpu"), (
+                    before,
+                    after,
+                    options,
+                )
+            finally:
+                session.reset()
+
+    @pytest.mark.parametrize("selection_mode", ["luid", "provider-option"])
+    def test_dml_device_luid_selection(
+        self, tmp_path: Path, gpu_model_arg: str, selection_mode: str, record_property
+    ) -> None:
+        """Verify both selectors with the same real GPU workload as other perf tests."""
+        require_ep("dml", device="gpu")
+        from winml.modelkit.session import EPDeviceTarget, WinMLEPRegistry
+        from winml.modelkit.sysinfo import enumerate_compute_adapters, get_ep_device_luid
+
+        selected = WinMLEPRegistry.instance().auto_device(EPDeviceTarget(ep="dml", device="gpu"))
+        advertised_luids = [
+            get_ep_device_luid(device.ort_handle)
+            for device in selected.ep.devices
+            if device.device_type == "GPU"
+        ]
+        assert advertised_luids and None not in advertised_luids, "DML must publish an adapter LUID"
+        luids = {luid for luid in advertised_luids if luid is not None}
+        native_luids = {adapter.luid for adapter in enumerate_compute_adapters()}
+        test_luid = physical_dml_test_luid(selected)
+        if test_luid is None:
+            assert luids <= native_luids
+        else:
+            # This agent deliberately exercises its real GPU through both CLI
+            # selectors. Keep the full ORT inventory for diagnostics, not as a
+            # list of devices on which inference is safe after an RDP switch.
+            record_property("dml_test_scope", "physical_gpu")
+            record_property("dml_ort_luids", ",".join(sorted(luids)))
+            record_property("dml_physical_luid", test_luid)
+            luids = {test_luid}
+
+        for index, luid in enumerate(sorted(luids)):
+            output_file = tmp_path / f"gpu_{index}.json"
+            args = _build_perf_args(
+                model_arg=gpu_model_arg,
+                output_file=output_file,
+                ep="dml",
+                device="gpu",
+                monitor=True,
+                duration_overwrite=1,
+                use_test_gpu=False,  # Exercise each selector independently below.
+            )
+            if selection_mode == "luid":
+                selection_args = ["--device-luid", luid]
+            else:
+                device = next(
+                    device
+                    for device in selected.ep.devices
+                    if get_ep_device_luid(device.ort_handle) == luid
+                )
+                device_id = device.ort_handle.ep_options["device_id"]
+                selection_args = ["--ep-options", f"device_id={device_id}"]
+            # The fixture is already ONNX. Test runtime selection, without
+            # an independent build/compile phase that does not honor the pin.
+            result = _run_winml_cli_subprocess(["perf", *args, "--skip-build", *selection_args])
+            assert result.returncode == 0, result.stdout + result.stderr
+            diagnostics = result.stdout + result.stderr
+            data = json.loads(output_file.read_text())
+            assert data["benchmark_info"]["device_luid"] == (
+                luid if selection_mode == "luid" else None
+            )
+            assert data["hw_monitor"]["adapter_luid"] == luid, (
+                selection_args,
+                data["benchmark_info"],
+                data["hw_monitor"],
+                diagnostics,
+            )
+            assert data["hw_monitor"]["device_kind"] == "gpu"
+            assert "Multiple devices match" not in diagnostics
+
+        result = _run_winml_cli_subprocess(
+            [
+                "perf",
+                "--skip-build",
+                *_build_perf_args(
+                    model_arg=gpu_model_arg,
+                    output_file=tmp_path / "default_gpu.json",
+                    ep="dml",
+                    device="gpu",
+                ),
+            ]
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        if test_luid is None:
+            assert ("Multiple devices match" in result.stderr) == (len(luids) > 1)
+        else:
+            # The shared-agent path must explicitly select the real GPU; default
+            # selection remains covered on agents without the opt-in.
+            data = json.loads((tmp_path / "default_gpu.json").read_text())
+            assert data["benchmark_info"]["device_luid"] == test_luid
+            assert "Multiple devices match" not in result.stderr
 
     @pytest.fixture
     def model_arg(self, onnx_model_path: Path) -> str:
@@ -797,6 +921,57 @@ class TestPerfONNXDirect(_PerfBenchmarkSuite):
         assert data["benchmark_info"]["effective_batch_size"] == effective_batch
         assert data["latency_ms"]["mean"] > 0
 
+    def test_op_tracing_basic_trtrtx_gpu(self, tmp_path: Path, onnx_model_path: Path):
+        """Trace a generated graph and compare reported timings with the real EP artifact."""
+        require_ep("nv_tensorrt_rtx", device="gpu")
+        output_file = tmp_path / "perf_op_tracing_trtrtx_gpu.json"
+        result = CliRunner().invoke(
+            perf,
+            _build_perf_args(
+                model_arg=str(onnx_model_path),
+                output_file=output_file,
+                device="gpu",
+                ep="nv_tensorrt_rtx",
+                op_tracing="basic",
+                memory=False,
+            ),
+            obj={},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
+        output = json.loads(output_file.read_text(encoding="utf-8"))
+        trace = output["hw_monitor"]["ep_proof"]
+        assert trace["status"] == "ok"
+        assert trace["metadata"]["device"] == "gpu"
+        assert trace["metadata"]["num_samples"] == output["benchmark_info"]["iterations"]
+        assert trace["operators"]
+
+        payload = json.loads(Path(trace["artifacts"]["profile"]).read_text(encoding="utf-8"))
+        events = payload["traceEvents"] if isinstance(payload, dict) else payload
+        layers = [
+            event
+            for event in events
+            if event.get("cat") == "nv::trt::layer" and event.get("ph") == "X"
+        ]
+        warmup = output["benchmark_info"]["warmup"]
+        measured = output["benchmark_info"]["iterations"]
+        retained = []
+        for pid in dict.fromkeys(event["pid"] for event in layers):
+            context = [event for event in layers if event["pid"] == pid]
+            tids = list(dict.fromkeys(event["tid"] for event in context))
+            retained.extend(
+                event for event in context if event["tid"] in tids[warmup : warmup + measured]
+            )
+        assert {operator["op_path"] for operator in trace["operators"]} == {
+            event["name"] for event in retained
+        }
+        for operator in trace["operators"]:
+            expected = sum(
+                event["dur"] for event in retained if event["name"] == operator["op_path"]
+            )
+            assert sum(operator["samples_us"]) == pytest.approx(expected)
+            assert len(operator["samples_us"]) == measured
+
     def test_op_tracing_basic_qnn_npu(self, tmp_path: Path, npu_model_arg: str):
         """--op-tracing basic produces a QNN NPU operator trace."""
         require_ep("qnn")
@@ -820,8 +995,9 @@ class TestPerfONNXDirect(_PerfBenchmarkSuite):
 
         assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
         assert output_file.exists()
-        assert trace_output.exists()
-        trace = json.loads(trace_output.read_text())
+        assert not trace_output.exists()
+        output = json.loads(output_file.read_text())
+        trace = output["hw_monitor"]["ep_proof"]
         assert trace["metadata"]["device"] == "npu"
         assert trace["metadata"]["ep"] == EP_ALIASES["qnn"]
         assert trace["metadata"]["tracing_level"] == "basic"
@@ -843,16 +1019,11 @@ class TestPerfHuggingFace:
 
         output_file = tmp_path / f"perf_hf_{ep}_cpu.json"
 
-        runner = CliRunner()
-        result = runner.invoke(
-            perf,
+        _run_perf_cli(
             _build_perf_args(
                 model_arg=model_arg, output_file=output_file, device="cpu", ep=ep, monitor=True
-            ),
-            obj={},
-            catch_exceptions=False,
+            )
         )
-        assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
 
         assert output_file.exists()
         data = json.loads(output_file.read_text())
@@ -867,9 +1038,7 @@ class TestPerfHuggingFace:
 
         output_file = tmp_path / f"perf_hf_{ep}_gpu.json"
 
-        runner = CliRunner()
-        result = runner.invoke(
-            perf,
+        _run_perf_cli(
             _build_perf_args(
                 model_arg=model_arg,
                 output_file=output_file,
@@ -877,11 +1046,8 @@ class TestPerfHuggingFace:
                 ep=ep,
                 monitor=True,
                 duration_overwrite=3,
-            ),
-            obj={},
-            catch_exceptions=False,
+            )
         )
-        assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
 
         assert output_file.exists()
         data = json.loads(output_file.read_text())
@@ -901,16 +1067,11 @@ class TestPerfHuggingFace:
 
         output_file = tmp_path / f"perf_hf_{ep}_npu.json"
 
-        runner = CliRunner()
-        result = runner.invoke(
-            perf,
+        _run_perf_cli(
             _build_perf_args(
                 model_arg=model_arg, output_file=output_file, device="npu", ep=ep, monitor=True
-            ),
-            obj={},
-            catch_exceptions=False,
+            )
         )
-        assert result.exit_code == 0, f"perf failed (exit {result.exit_code}):\n{result.output}"
 
         assert output_file.exists()
         data = json.loads(output_file.read_text())
@@ -1173,27 +1334,28 @@ class TestPerfT5Composite:
 
 
 # ===========================================================================
-# GenAI runtime (winml-genai): --device / --ep override
+# GenAI runtime (ort-genai): --device / --ep override
 # ===========================================================================
 
 
 def _genai_perf_args(
     *,
-    bundle_dir: Path,
+    model_arg: str | Path,
     output_file: Path,
     device: str | None = None,
     ep: str | None = None,
+    runtime: str = "ort-genai",
 ) -> list[str]:
-    """Build argv for a fast winml-genai perf run against a tiny bundle.
+    """Build argv for a fast genai perf run against a model ID or bundle.
 
     Kept deliberately small (2 iterations, 1 warmup, 4 new tokens) so the
     generation loop stays quick while still producing real timing samples.
     """
     args: list[str] = [
         "-m",
-        str(bundle_dir),
+        str(model_arg),
         "--runtime",
-        "winml-genai",
+        runtime,
         "--iterations",
         "2",
         "--warmup",
@@ -1211,9 +1373,9 @@ def _genai_perf_args(
 
 
 class TestPerfGenaiContract:
-    """Contract for the winml-genai ``config`` sentinel — no bundle required.
+    """Contract for the ort-genai ``config`` sentinel — no bundle required.
 
-    These lock the CLI surface that ``config`` is a winml-genai-only
+    These lock the CLI surface that ``config`` is a ort-genai-only
     ``--device`` value: it is advertised in ``--help`` and rejected with a
     helpful message on the single-shot ONNX path. They run on any host under
     ``-m e2e`` (no genai stack, model download, or accelerator needed).
@@ -1224,7 +1386,7 @@ class TestPerfGenaiContract:
         result = CliRunner().invoke(perf, ["--help"], obj={}, catch_exceptions=False)
         assert result.exit_code == 0
         assert "[config|auto|cpu|gpu|npu]" in result.output
-        assert "winml-genai only" in result.output
+        assert "ort-genai only" in result.output
 
     def test_onnx_rejects_device_config(self, tmp_path: Path, onnx_model_path: Path):
         """``--device config`` is rejected on the ONNX runtime (genai-only sentinel)."""
@@ -1240,8 +1402,102 @@ class TestPerfGenaiContract:
         )
 
         assert result.exit_code == 2, f"expected UsageError exit 2, got {result.exit_code}"
-        assert "--device config is only valid with --runtime winml-genai" in result.output
+        assert "--device config is only valid with --runtime ort-genai" in result.output
         assert not output_file.exists(), "no report should be written on rejection"
+
+
+@pytest.mark.slow
+@pytest.mark.network
+@pytest.mark.timeout(600)
+def test_genai_cpu_autobuild_and_cached_entrypoints(tmp_path: Path, monkeypatch):
+    """Exercise the real four-stage build once, then reuse it without HF access."""
+    model_id = "yujiepan/qwen3-tiny-random"
+    cache_dir = tmp_path / "winml-cache"
+    monkeypatch.setenv("WINML_CACHE_DIR", str(cache_dir))
+    assert not cache_dir.exists()
+
+    def run(
+        name: str,
+        model_arg: str | Path,
+        *,
+        device: str | None = None,
+        ep: str | None = None,
+        runtime: str = "ort-genai",
+        timeout: int = 60,
+    ) -> dict:
+        output = tmp_path / f"{name}.json"
+        result = _run_winml_cli_subprocess(
+            [
+                "perf",
+                *_genai_perf_args(
+                    model_arg=model_arg,
+                    output_file=output,
+                    device=device,
+                    ep=ep,
+                    runtime=runtime,
+                ),
+                "--no-compile",
+                "--no-memory",
+                "--no-color",
+                "--prompt",
+                "What is the capital of France?",
+            ],
+            timeout=timeout,
+        )
+        assert result.returncode == 0, (
+            f"{name} failed (exit {result.returncode}):\n{result.stdout}\n{result.stderr}"
+        )
+        assert output.is_file(), result.stdout
+        data = json.loads(output.read_text(encoding="utf-8"))
+        info = data["benchmark_info"]
+        assert info["runtime"] == "ort-genai"
+        assert info["ep"] == info["effective_device"] == "cpu"
+        assert info["compile"] is False
+        assert info["warmup"] == 1
+        assert info["iterations"] == 2
+        assert info["max_new_tokens"] == 4
+        requests = data["requests"]
+        assert [request["kind"] for request in requests] == ["warmup", "timed", "timed"]
+        assert all(request["prompt_tokens"] > 0 for request in requests)
+        assert all(0 < request["generated_tokens"] <= 4 for request in requests)
+        return data
+
+    cold = run("cold", model_id, device="cpu", timeout=300)
+    assert cold["benchmark_info"]["device"] == "cpu"
+    bundle_dir = Path(cold["benchmark_info"]["bundle_dir"])
+    assert bundle_dir.resolve().is_relative_to(cache_dir.resolve())
+    config = json.loads((bundle_dir / "genai_config.json").read_text(encoding="utf-8"))
+    pipeline = config["model"]["decoder"]["pipeline"]
+    assert len(pipeline) > 1, "must exercise WinML's staged bundle, not a flat third-party export"
+    for entry in pipeline:
+        for stage in entry.values():
+            assert (bundle_dir / stage["filename"]).is_file()
+            assert not stage.get("session_options", {}).get("provider_options"), (
+                "the CPU build must not leave accelerator-routed stages in the saved bundle"
+            )
+
+    bundle_files = {
+        path.relative_to(bundle_dir): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in bundle_dir.rglob("*")
+        if path.is_file()
+    }
+    # Empty, offline HF caches make accidental model resolution/rebuild fail.
+    offline_cache = tmp_path / "offline-hf"
+    monkeypatch.setenv("HF_HOME", str(offline_cache))
+    monkeypatch.setenv("HF_HUB_CACHE", str(offline_cache / "hub"))
+    monkeypatch.setenv("TRANSFORMERS_CACHE", str(offline_cache / "transformers"))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+
+    cached = run("cached", model_id, ep="CPUExecutionProvider")
+    assert Path(cached["benchmark_info"]["bundle_dir"]) == bundle_dir
+    prebuilt = run("prebuilt", bundle_dir, device="cpu", runtime="auto")
+    assert Path(prebuilt["benchmark_info"]["bundle_dir"]) == bundle_dir
+    assert {
+        path.relative_to(bundle_dir): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in bundle_dir.rglob("*")
+        if path.is_file()
+    } == bundle_files, "cache-hit and prebuilt runs must not rebuild or recompile the bundle"
 
 
 @pytest.mark.slow
@@ -1293,6 +1549,8 @@ class TestPerfGenai:
             proc = subprocess.run(  # noqa: S603 -- trusted args (sys.executable + constants)
                 cmd,
                 capture_output=True,
+                encoding="utf-8",
+                errors="replace",
                 text=True,
                 timeout=1500,
                 check=False,
@@ -1320,7 +1578,7 @@ class TestPerfGenai:
         """Invoke perf on the bundle and return the parsed JSON report."""
         result = CliRunner().invoke(
             perf,
-            _genai_perf_args(bundle_dir=bundle, output_file=output_file, device=device, ep=ep),
+            _genai_perf_args(model_arg=bundle, output_file=output_file, device=device, ep=ep),
             obj={},
             catch_exceptions=False,
         )
@@ -1329,7 +1587,7 @@ class TestPerfGenai:
         )
         assert output_file.exists(), f"report not written: {output_file}"
         data = json.loads(output_file.read_text())
-        assert data["benchmark_info"]["runtime"] == "winml-genai"
+        assert data["benchmark_info"]["runtime"] == "ort-genai"
         assert data["benchmark_info"]["generated_tokens"] > 0
         return data
 

@@ -103,6 +103,19 @@ class PositionalExportOrderModel(nn.Module):
         return torch.cat((wide, narrow), dim=1)
 
 
+class PositionalOnlyHierarchyModel(nn.Module):
+    """Model whose positional protocol differs from input insertion order."""
+
+    def get_export_args(self, inputs):
+        return inputs["narrow"], inputs["wide"]
+
+    def forward(self, *args):
+        narrow, wide = args
+        if narrow.shape[1] >= wide.shape[1]:
+            raise ValueError("positional export protocol was not honored")
+        return torch.cat((narrow, wide), dim=1)
+
+
 # =============================================================================
 # TestInputTensorSpecToTensor
 # =============================================================================
@@ -131,6 +144,16 @@ class TestInputTensorSpecToTensor:
         t = spec.to_tensor()
         assert t.dtype == torch.int64
         assert (t == 1).all()
+
+    @pytest.mark.parametrize("value_range", [None, (0, 2)])
+    def test_bool_tensor_preserves_dtype(self, value_range) -> None:
+        spec = InputTensorSpec(
+            name="selector", dtype="bool", shape=(1, 64), value_range=value_range
+        )
+        tensor = spec.to_tensor()
+        assert tensor.shape == spec.shape
+        assert tensor.dtype == torch.bool
+        assert torch.all((tensor == 0) | (tensor == 1))
 
     def test_bbox_tensor_generates_ordered_coordinates_within_range(self) -> None:
         spec = InputTensorSpec(
@@ -437,6 +460,22 @@ class TestExportPytorch:
             for tensor in onnx_model.graph.input
         }
         assert input_shapes == {"narrow": (1, 3), "wide": (1, 5)}
+
+    def test_hierarchy_trace_honors_get_export_args(self) -> None:
+        """Hierarchy tracing uses the same positional protocol as ONNX export."""
+        from winml.modelkit.export.htp import HTPExporter
+
+        model = PositionalOnlyHierarchyModel()
+        inputs = {
+            "wide": torch.ones(1, 5),
+            "narrow": torch.ones(1, 3),
+        }
+        exporter = HTPExporter()
+
+        exporter._trace_model_hierarchy(model, inputs)
+
+        assert exporter._hierarchy_builder is not None
+        assert exporter._hierarchy_builder.model_outputs.shape == (1, 8)
 
 
 class TestStaleExternalDataCleanup:

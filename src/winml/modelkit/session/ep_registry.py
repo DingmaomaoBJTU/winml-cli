@@ -14,13 +14,14 @@ from __future__ import annotations
 import contextlib
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import onnxruntime as ort
 
 from ..ep_path import BuiltinSource, EPEntry, discover_all_eps
+from ..sysinfo import get_ep_device_luid, gpu_priority_key
 from .ep_device import (
     DeviceNotFound,
     EPDeviceTarget,
@@ -88,16 +89,20 @@ def _suppress_dll_load_dialogs() -> Iterator[None]:
 
 
 def _dedup_ort_devices(devices: list[ort.OrtEpDevice]) -> list[ort.OrtEpDevice]:
-    """Collapse OrtEpDevices that share ``(vendor_id, device_id, type)``.
+    """Collapse duplicate routes to the same adapter, identified by LUID.
 
-    Some hosts (dual-iGPU listings, OpenVINO on Intel) emit duplicate handles
-    for the same physical device.
+    PCI vendor/device IDs identify a product, not a physical adapter. Without
+    a LUID, retain every handle rather than hiding identical installed GPUs.
     """
-    seen: set[tuple[int, int, str]] = set()
+    seen: set[tuple[str, str, str, tuple[tuple[str, str], ...]]] = set()
     out: list[ort.OrtEpDevice] = []
     for d in devices:
         try:
-            key = (d.device.vendor_id, d.device.device_id, d.device.type.name)
+            luid = get_ep_device_luid(d)
+            if luid is None:
+                out.append(d)
+                continue
+            key = (luid, d.ep_name, d.device.type.name, tuple(sorted(d.ep_options.items())))
         except AttributeError:
             out.append(d)
             continue
@@ -213,6 +218,10 @@ class WinMLEP:
                     "device_type": d.device_type,
                     "hardware_name": d.hardware_name,
                     "vendor": d.vendor,
+                    "luid": get_ep_device_luid(d._ort),
+                    "high_performance_index": d._ort.device.metadata.get(
+                        "DxgiHighPerformanceIndex"
+                    ),
                     "facts": list(d.ep_facts()),
                     "device_facts": list(d.device_facts()),
                 }
@@ -376,6 +385,44 @@ class WinMLEPRegistry:
         """
         return [e for e in self._discovered if e.ep_name == ep_full_name]
 
+    def ensure_discovered_ep(
+        self,
+        ep_name: str,
+        *,
+        source: str | None = None,
+    ) -> tuple[EPEntry, ...]:
+        """Return entries for an explicit EP, acquiring its Catalog package if needed."""
+        ep_full = expand_ep_name(ep_name)
+        candidates = self._entries_for(ep_full)
+        catalog_missing = source == "winml-catalog" and not any(
+            _entry_source_tag(entry) == "winml-catalog" for entry in candidates
+        )
+        if source in (None, "winml-catalog") and (not candidates or catalog_missing):
+            from ..ep_path import _resolve_requested_winml_catalog_ep
+
+            catalog_entries = _resolve_requested_winml_catalog_ep(ep_full)
+            existing_keys = {
+                (entry.ep_name, entry.dll_path, _entry_source_tag(entry))
+                for entry in self._discovered
+            }
+            has_primary = any(entry.status == "primary" for entry in candidates)
+            added = False
+            for entry in catalog_entries:
+                key = (entry.ep_name, entry.dll_path, _entry_source_tag(entry))
+                if key in existing_keys:
+                    continue
+                if has_primary:
+                    entry = replace(entry, status="shadowed")
+                else:
+                    has_primary = True
+                self._discovered.append(entry)
+                existing_keys.add(key)
+                added = True
+            if added:
+                self._available_eps_cache = None
+                candidates = self._entries_for(ep_full)
+        return tuple(candidates)
+
     def register_ep(self, entry: EPEntry) -> WinMLEP:
         """Return the WinMLEP for ``entry.dll_path``, loading the DLL if needed.
 
@@ -443,6 +490,11 @@ class WinMLEPRegistry:
             # to resolve — the error surfaces via the ORT exception below,
             # which the caller renders to the console.
             with _suppress_dll_load_dialogs():
+                if entry.ep_name == "WinMLCGExecutionProvider":
+                    from ._runtime_import import import_runtime
+
+                    # Preload WinMLRuntimeCore and WinMLCG's delay-loaded dependencies.
+                    import_runtime()
                 ort.register_execution_provider_library(arg0, str(entry.dll_path))
                 logger.info(
                     "Registered EP %r from %r (arg0=%r)", entry.ep_name, entry.dll_path, arg0
@@ -504,24 +556,28 @@ class WinMLEPRegistry:
         ort.unregister_execution_provider_library(winml_ep.arg0)
         self._registered.pop(winml_ep.source.dll_path, None)
 
-    def auto_device(self, target: EPDeviceTarget) -> WinMLEPDevice:
+    def auto_device(
+        self, target: EPDeviceTarget, *, device_luid: str | None = None
+    ) -> WinMLEPDevice:
         """Find the first source satisfying ``target`` (ep + device + optional source).
 
         ``target`` must be fully resolved (no ``"auto"`` values). Filters
         the cached :attr:`_discovered` list by ``target.ep`` + optional
         ``target.source`` tag, then tries each candidate in precedence
         order. First registration that succeeds *and* exposes
-        ``target.device`` wins.
+        ``target.device`` wins. When ``device_luid`` is given, only the
+        adapter with that LUID (as displayed by ``winml sys``) can match.
+        Unpinned GPUs use the Windows high-performance index, then LUID,
+        rather than ORT enumeration order.
 
         Raises:
             ValueError: when ``target`` still contains an ``"auto"`` axis.
             WinMLEPNotDiscovered: no candidate EPEntry for the requested ep.
             UnknownListingPick: ``target.source`` is set but doesn't match any
                 discovered EPEntry for ``target.ep``.
-            WinMLEPRegistrationFailed: every candidate either failed to
-                register or exposed no matching device class.
-            DeviceNotFound: candidates registered cleanly but none exposed
-                ``target.device``.
+            WinMLEPRegistrationFailed: every candidate failed to register.
+            DeviceNotFound: at least one candidate registered cleanly but
+                none exposed the requested device class and optional LUID.
         """
         if target.ep == "auto" or target.device == "auto":
             raise ValueError(
@@ -529,12 +585,13 @@ class WinMLEPRegistry:
             )
 
         ep_full = expand_ep_name(target.ep)
-        candidates = self._entries_for(ep_full)
+        candidates = list(self.ensure_discovered_ep(ep_full, source=target.source))
 
         if not candidates:
             raise WinMLEPNotDiscovered(
                 f"No EPEntry discovered for ep={target.ep!r}. "
-                f"Hint: install the plugin or set WINMLCLI_EP_PATH."
+                f"Hint: verify Windows ML EP Catalog support, install a BYO plugin, "
+                f"or set WINMLCLI_EP_PATH."
             )
 
         if target.source is not None:
@@ -545,23 +602,34 @@ class WinMLEPRegistry:
 
         target_device_upper = target.device.upper()
         last_error: Exception | None = None
+        any_registered = False
         for entry in candidates:
             try:
                 winml_ep = self.register_ep(entry)
             except WinMLEPRegistrationFailed as e:
                 last_error = e
                 continue
-            for device in winml_ep.devices:
-                if device.device_type == target_device_upper:
+            any_registered = True
+            devices = winml_ep.devices
+            if target_device_upper == "GPU" and device_luid is None:
+                devices = tuple(
+                    sorted(
+                        devices,
+                        key=lambda device: gpu_priority_key(
+                            get_ep_device_luid(device.ort_handle),
+                            device.ort_handle.device.metadata.get("DxgiHighPerformanceIndex"),
+                        ),
+                    )
+                )
+            for device in devices:
+                if device.device_type == target_device_upper and (
+                    device_luid is None
+                    or (get_ep_device_luid(device.ort_handle) or "").casefold()
+                    == device_luid.casefold()
+                ):
                     return WinMLEPDevice(ep=winml_ep, device=device)
-            # Registration succeeded but no device-class match — this
-            # candidate is NOT a registration failure, so don't let a
-            # prior candidate's stale traceback survive into the
-            # post-loop `last_error is not None` branch (T-04).
-            last_error = None
-
         # All candidates exhausted without a match.
-        if last_error is not None:
+        if not any_registered and last_error is not None:
             raise WinMLEPRegistrationFailed(
                 f"No compatible source for {target.ep}/{target.device}; "
                 f"all {len(candidates)} candidates failed"
@@ -569,6 +637,12 @@ class WinMLEPRegistry:
         raise DeviceNotFound(
             f"No source for {target.ep}/{target.device} exposed device "
             f"class {target.device.upper()!r}"
+            + (
+                f" with LUID {device_luid!r}. Run 'winml sys' to list adapter LUIDs; "
+                "the selected EP must expose that adapter's LUID."
+                if device_luid is not None
+                else ""
+            )
         )
 
     def all_discovered(self) -> tuple[EPEntry, ...]:

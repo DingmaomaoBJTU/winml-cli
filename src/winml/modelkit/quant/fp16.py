@@ -1775,6 +1775,110 @@ def _reject_scope_unsafe_value_info_lookups(
                 reserve_late_tensor(graph, node, "output", output_index)
 
 
+def _rename_generated_io_cast_name_collisions(
+    model: ModelProto,
+    *,
+    keep_io_types: bool,
+    op_block_list: list[str] | None,
+) -> None:
+    """Free ORT's I/O Cast names without changing public I/O or tensor bindings.
+
+    Only top-level internal tensors are renamed. Captures are updated in all
+    descendant graphs, including blocked graphs, but local definitions shadow
+    the rename. Public I/O collisions are left to the existing rejection guard.
+    Inferred types select reserved names and conversion-relevant nodes without
+    copying inferred metadata back into the model.
+    """
+    if not keep_io_types:
+        return
+
+    inferred_model = _ort_inference_preflight_model(model)
+    name_mapping, reserved_nodes = _ort_keep_io_name_mapping(
+        inferred_model, keep_io_types=keep_io_types
+    )
+    reserved_tensors = set(name_mapping.values())
+    public_names = {
+        value.name
+        for values in (getattr(model.graph, "input", []), getattr(model.graph, "output", []))
+        for value in values
+    }
+    if reserved_tensors & public_names:
+        return
+
+    tensor_collisions = reserved_tensors & _graph_tensor_names(model.graph)
+    nodes_to_rename = [
+        node
+        for graph, inferred_graph in zip(
+            _ort_traversed_graphs(model, op_block_list),
+            _ort_traversed_graphs(inferred_model, op_block_list),
+            strict=True,
+        )
+        for node, inferred_node in zip(graph.node, inferred_graph.node, strict=True)
+        if node.name in reserved_nodes
+        and not _node_is_conversion_neutral(inferred_model, inferred_graph, inferred_node)
+    ]
+    if not tensor_collisions and not nodes_to_rename:
+        return
+
+    graphs = _all_graphs(model)
+    occupied_names = reserved_nodes | reserved_tensors
+    for graph in graphs:
+        occupied_names.update(_graph_tensor_names(graph))
+        occupied_names.update(node.name for node in getattr(graph, "node", []))
+        for annotation in getattr(graph, "quantization_annotation", []):
+            occupied_names.add(annotation.tensor_name)
+            occupied_names.update(entry.value for entry in annotation.quant_parameter_tensor_names)
+
+    def allocate_name(name: str) -> str:
+        suffix = 1
+        candidate = f"{name}__existing_{suffix}"
+        while candidate in occupied_names:
+            suffix += 1
+            candidate = f"{name}__existing_{suffix}"
+        occupied_names.add(candidate)
+        return candidate
+
+    tensor_renames = {name: allocate_name(name) for name in sorted(tensor_collisions)}
+    node_renames = [(node, allocate_name(node.name)) for node in nodes_to_rename]
+    graph_renames = [(model.graph, tensor_renames)]
+    for graph, renames in graph_renames:
+        for child in _iter_all_child_graphs(graph):
+            child_renames = {
+                name: replacement
+                for name, replacement in renames.items()
+                if not _graph_defines_name(child, name)
+            }
+            if child_renames:
+                graph_renames.append((child, child_renames))
+
+    for graph, renames in graph_renames:
+        for node in getattr(graph, "node", []):
+            for values in (node.input, node.output):
+                for index, name in enumerate(values):
+                    if name in renames:
+                        values[index] = renames[name]
+        for values in (
+            getattr(graph, "input", []),
+            getattr(graph, "output", []),
+            getattr(graph, "value_info", []),
+            getattr(graph, "initializer", []),
+        ):
+            for value in values:
+                if value.name in renames:
+                    value.name = renames[value.name]
+        for sparse in getattr(graph, "sparse_initializer", []):
+            if sparse.values.name in renames:
+                sparse.values.name = renames[sparse.values.name]
+        for annotation in getattr(graph, "quantization_annotation", []):
+            if annotation.tensor_name in renames:
+                annotation.tensor_name = renames[annotation.tensor_name]
+            for entry in annotation.quant_parameter_tensor_names:
+                if entry.value in renames:
+                    entry.value = renames[entry.value]
+    for node, replacement in node_renames:
+        node.name = replacement
+
+
 def _reject_generated_io_cast_name_collisions(
     model: ModelProto,
     *,
@@ -2539,10 +2643,10 @@ def _binding_converts_to_fp16(
     )
 
 
-def _local_function_executed_attributes(
+def _local_function_validated_attributes(
     model: ModelProto, node: NodeProto
-) -> list[AttributeProto] | None:
-    """Resolve supplied or default attributes referenced by a local function."""
+) -> list[AttributeProto]:
+    """Resolve supplied and default attributes that ORT validates."""
     function = next(
         (
             candidate
@@ -2554,23 +2658,11 @@ def _local_function_executed_attributes(
         None,
     )
     if function is None:
-        return None
-    referenced_attributes: set[str] = set()
-    pending_nodes = list(function.node)
-    while pending_nodes:
-        function_node = pending_nodes.pop()
-        for attribute in function_node.attribute:
-            if attribute.ref_attr_name:
-                referenced_attributes.add(attribute.ref_attr_name)
-            for child in _iter_graphs_from_attribute(attribute):
-                pending_nodes.extend(child.node)
-    supplied = {attribute.name: attribute for attribute in node.attribute}
-    defaults = {attribute.name: attribute for attribute in function.attribute_proto}
-    return [
-        attribute
-        for name in referenced_attributes
-        if (attribute := supplied.get(name, defaults.get(name))) is not None
-    ]
+        return list(node.attribute)
+
+    attributes = {attribute.name: attribute for attribute in function.attribute_proto}
+    attributes.update({attribute.name: attribute for attribute in node.attribute})
+    return list(attributes.values())
 
 
 def _function_contains_concrete_float(function: FunctionProto) -> bool:
@@ -2767,12 +2859,9 @@ def _reject_blocked_subgraph_converted_captures(
         for node in getattr(graph, "node", []):
             if not _ort_skips_node_attributes(node, blocked_ops):
                 continue
-            executed_attributes = _local_function_executed_attributes(model, node)
             children = (
                 child
-                for attribute in (
-                    node.attribute if executed_attributes is None else executed_attributes
-                )
+                for attribute in _local_function_validated_attributes(model, node)
                 for child in _iter_graphs_from_attribute(attribute)
             )
             for child in children:
@@ -2906,6 +2995,14 @@ def convert_to_fp16(
 
     _reject_sparse_initializer_tensor_metadata(model, op_block_list)
     _reject_duplicate_float_initializer_names(model, op_block_list)
+    original_model = model
+    if keep_io_types:
+        model = deepcopy(model)
+    _rename_generated_io_cast_name_collisions(
+        model,
+        keep_io_types=keep_io_types,
+        op_block_list=op_block_list,
+    )
     io_preflight_model = _ort_inference_preflight_model(model)
     blocked_ops = _effective_blocked_ops(op_block_list)
     _reject_unpreserved_float_container_io(
@@ -3008,7 +3105,9 @@ def convert_to_fp16(
     if needs_safe_conversion:
         _reject_unloaded_external_initializer_outputs(model, op_block_list)
     original_nodes = len(model.graph.node)
-    conversion_model = deepcopy(model) if needs_safe_conversion else model
+    conversion_model = (
+        deepcopy(model) if needs_safe_conversion and model is original_model else model
+    )
     if needs_safe_conversion:
         _internalize_external_initializer_outputs(conversion_model, op_block_list)
         _internalize_selected_external_initializers(
@@ -3064,9 +3163,9 @@ def convert_to_fp16(
         _validate_converted_types(converted)
     _validate_local_function_conversion(converted)
 
-    if converted is not model:
-        model.CopyFrom(converted)
-        converted = model
+    if converted is not original_model:
+        original_model.CopyFrom(converted)
+        converted = original_model
 
     converted_nodes = len(converted.graph.node)
     if converted_nodes != original_nodes:

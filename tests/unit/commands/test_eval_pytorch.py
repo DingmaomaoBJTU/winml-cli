@@ -24,7 +24,7 @@ class TestPyTorchRuntimeCli:
         result = CliRunner().invoke(eval, ["--help"])
 
         assert result.exit_code == 0
-        assert "--runtime [winml|pytorch]" in result.output
+        assert "--runtime [winml-ort|winml-runtime|pytorch]" in result.output
 
     def test_pytorch_runtime_dispatches_pytorch(self, tmp_path) -> None:
         captured: dict[str, WinMLEvaluationConfig] = {}
@@ -89,7 +89,7 @@ class TestPyTorchRuntimeCli:
             )
 
         assert result.exit_code == 0, result.output
-        assert captured["config"].runtime == "winml"
+        assert captured["config"].runtime == "winml-ort"
 
     def test_pytorch_runtime_loads_from_config_file(self, tmp_path) -> None:
         config_path = tmp_path / "eval.json"
@@ -129,6 +129,7 @@ class TestPyTorchRuntimeCli:
         ("field", "value"),
         [
             ("ep", "cpu"),
+            ("device_luid", "0x00000000_0x00000001"),
             ("use_cache", True),
             ("skip_build", True),
             ("quant", True),
@@ -168,6 +169,10 @@ class TestPyTorchRuntimeCli:
         ("args", "expected_flag"),
         [
             (["--ep", "cpu"], "--ep"),
+            (
+                ["--device-luid", "0x00000000_0x00000001"],
+                "--device-luid",
+            ),
             (["--precision", "fp16"], "--precision"),
             (["--no-quant"], "--quant/--no-quant"),
             (["--no-optimize"], "--optimize/--no-optimize"),
@@ -355,7 +360,7 @@ class TestNativeEvaluation:
         assert result.config.runtime == "pytorch"
         assert result.config.model_id == "inferred/model"
         assert result.config.device == "cpu"
-        assert config.runtime == "winml"
+        assert config.runtime == "winml-ort"
         assert config.model_id is None
 
     def test_public_evaluate_sets_real_supplied_module_to_eval_mode(self) -> None:

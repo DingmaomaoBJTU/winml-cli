@@ -72,7 +72,7 @@ class LiveMonitorDisplay:
         chart_width: int = 120,
         chart_height: int = 15,
         poll_interval_ms: int = 100,
-        device_kind: str | None | _OmittedDeviceKind = _DEVICE_KIND_OMITTED,
+        device_kind: str | _OmittedDeviceKind | None = _DEVICE_KIND_OMITTED,
         duration_sec: float | None = None,
         clock: Any = None,
     ) -> None:
@@ -131,9 +131,7 @@ class LiveMonitorDisplay:
         separator = " | "
         padded_line = "  " + separator.join(
             [
-                self._pad_status_cell(cell, _STATUS_CELL_WIDTH)
-                if index < len(cells) - 1
-                else cell
+                self._pad_status_cell(cell, _STATUS_CELL_WIDTH) if index < len(cells) - 1 else cell
                 for index, cell in enumerate(cells)
             ]
         )
@@ -198,10 +196,10 @@ class LiveMonitorDisplay:
         iteration: int,
         latency_ms: float,
         util_samples: list[float],
-        memory_local_mb: float = 0.0,
-        memory_shared_mb: float = 0.0,
+        memory_local_mb: float | None = None,
+        memory_shared_mb: float | None = None,
         cpu_pct: float = 0.0,
-        ram_mb: float = 0.0,
+        ram_mb: float | None = None,
         cpu_samples: list[float] | None = None,
         gpu_samples: list[float] | None = None,
         gpu_pct: float = 0.0,
@@ -275,7 +273,14 @@ class LiveMonitorDisplay:
                 return Text(f"  {adapter}: [{bar}] {current:.1f}%")
             return Text(f"  {adapter}: [waiting for data...]")
 
-        plt.clf()
+        # plotext API differs across releases: prefer the newer clear_figure,
+        # then fall back to legacy aliases when present.
+        if hasattr(plt, "clear_figure"):
+            plt.clear_figure()
+        elif hasattr(plt, "clf"):
+            plt.clf()
+        elif hasattr(plt, "clear_data"):
+            plt.clear_data()
         plt.theme("clear")
 
         # Compute moving window: keep last N seconds of samples
@@ -359,10 +364,10 @@ class LiveMonitorDisplay:
         iteration: int,
         latency_ms: float,
         util_samples: list[float],
-        memory_local_mb: float = 0.0,
-        memory_shared_mb: float = 0.0,
+        memory_local_mb: float | None = None,
+        memory_shared_mb: float | None = None,
         cpu_pct: float = 0.0,
-        ram_mb: float = 0.0,
+        ram_mb: float | None = None,
         gpu_pct: float = 0.0,
         cpu_samples: list[float] | None = None,
         gpu_samples: list[float] | None = None,
@@ -430,8 +435,11 @@ class LiveMonitorDisplay:
         row2_lines = self._pack_status_cells(row2_cells)
 
         # Row 3: Memory
-        ram_cell = f"Sys Mem: {ram_mb:.0f} MB"
-        mem_cell = f"Device Mem: {memory_local_mb:.0f}/{memory_shared_mb:.0f} MB (local/shared)"
+        ram_text = f"{ram_mb:.0f}" if ram_mb is not None else "N/A"
+        ram_cell = f"Process RAM: {ram_text} MiB"
+        local_text = f"{memory_local_mb:.0f}" if memory_local_mb is not None else "N/A"
+        shared_text = f"{memory_shared_mb:.0f}" if memory_shared_mb is not None else "N/A"
+        mem_cell = f"Device Mem: {local_text}/{shared_text} MiB (local/shared)"
         row3_lines = self._pack_status_cells([ram_cell, mem_cell])
 
         # Row 4: Inference

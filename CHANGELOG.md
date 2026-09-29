@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## WinML CLI v0.3.1
+
+This hotfix restores compatibility with current Transformers and Windows runtime dependencies, fixes VitisAI cache permissions, and stabilizes Hugging Face model export and evaluation.
+
+### 🐛 Fixes
+
+- **Hugging Face export and evaluation** — stabilized SDPA and attention-mask handling, decoder wrappers, BLIP export, QNN/HTP tracing, and processor resolution for Transformers 4.57 (#1372, #1379, #1384).
+- **VitisAI compilation** — moved the compilation cache under the user-writable WinML cache root instead of installation-relative protected paths (#1378).
+- **Runtime dependencies** — constrained `plotext` to the compatible 5.x series, required the published Windows ML runtime build, and routed QNN acquisition through the architecture-aware Windows ML EP Catalog so wheel installations preserve both QNN and DirectML without installing a conflicting standard ONNX Runtime distribution (#1372).
+
+### 📦 Assets
+
+- `winml_cli-0.3.1-py3-none-any.whl`
+- `rules-v0.3.1.zip`
+
 ## WinML CLI v0.3.0
 
 This cycle expands **model preparation and evaluation** across the CLI: precision-driven quantization, composite-model and dynamic-axis workflows, real-input perf/eval, optimization previews, and opt-in Dynamo export. It also introduces one-command Qwen3 onnxruntime-genai bundles, GenAI benchmarking, broader model recipes, and more reliable EP discovery, compilation, and monitoring. See the behavior changes below.
@@ -19,7 +34,7 @@ This cycle expands **model preparation and evaluation** across the CLI: precisio
 
 - **Quantization** — `--precision` selects FP16 conversion, RTN INT4, static QDQ, or calibration-free dynamic INT8; `winml quantize` can compose multiple precision passes such as INT4 followed by FP16 (#872, #985, #1047).
 - `winml build` — `--export-type optimized` produces a complete Qwen3 onnxruntime-genai NPU/QNN bundle, including prefill/decode, embeddings, LM head, tokenizer, and manifest files (#836, #996, #1008, #1081, #1104).
-- `winml perf --runtime winml-genai` — benchmarks prebuilt or automatically cached GenAI bundles with TTFT, token throughput, prompt-template controls, EP overrides, and isolated pre-compilation (#1015, #1042, #1046, #1054, #1109).
+- `winml perf --runtime ort-genai` — benchmarks prebuilt or automatically cached GenAI bundles with TTFT, token throughput, prompt-template controls, EP overrides, and isolated pre-compilation (#1015, #1042, #1046, #1054, #1109).
 - **Composite models** — `export` and `build` automatically fan out pipeline components; `export` / `build` / `perf` support `--submodel`, and explicit composite tasks such as summarization and translation are accepted (#1031, #1037, #1058, #1071, #1089).
 - **Export controls** — dynamic axes and symbolic input dimensions are supported while static TorchScript export remains the default; `build`, `config`, `perf`, and `eval` expose matching shape/input/export overrides (#1074, #1083, #1106, #1141, #1156, #1188).
 - `winml perf` — real `.npz` inputs, time-budgeted `--duration` runs, cached per-module builds, actual dynamic dimensions, and QNN profiler ONNX metrics (#1004, #1055, #1066, #1102, #1168).

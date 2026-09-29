@@ -482,7 +482,10 @@ def resolve_io_specs(
     # Generate dummy inputs for concrete shapes and dtypes,
     # intercepting value ranges from Optimum's tensor gen methods
     with intercept_value_ranges() as value_ranges:
-        dummy_inputs = onnx_config.generate_dummy_inputs(framework="pt", **shape_kwargs)
+        dummy_inputs = cast(
+            "dict[str, torch.Tensor]",
+            onnx_config.generate_dummy_inputs(framework="pt", **shape_kwargs),
+        )
 
     input_shapes = [tuple(t.shape) for t in dummy_inputs.values()]
     input_dtypes = [str(t.dtype).replace("torch.", "") for t in dummy_inputs.values()]

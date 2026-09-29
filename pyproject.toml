@@ -4,7 +4,7 @@ requires = [ "setuptools>=61", "wheel" ]
 
 [project]
 name = "winml-cli"
-version = "0.3.0"
+version = "0.3.1"
 description = "Accelerate Model Deployment on WinML"
 readme = "README.md"
 keywords = [ "onnx", "winml" ]
@@ -49,14 +49,16 @@ dependencies = [
   "onnxruntime-genai-winml==0.14.1 ; sys_platform == 'win32'",
   # Range, not an exact pin: the exact build `1.24.5.202604171637` is the PyPI
   # form of what WinML's wasdk metadata pins as `1.24.5.post202604171637` (PEP 440
-  # normalized) — an exact `==` can't reconcile the two. A bounded range keeps the
-  # 1.24.x series while resolving to the published wheel.
-  "onnxruntime-windowsml>=1.24.5,<1.25 ; sys_platform == 'win32'",
+  # normalized) — an exact `==` can't reconcile the two. Allow newer releases
+  # through 1.27 for OpenVINO operator profiling.
+  "onnxruntime-windowsml>=1.24.5,<1.28 ; sys_platform == 'win32'",
   "onnxscript>=0.2",
   "opentelemetry-sdk>=1.39.1",
   "optimum>=2",
   "optimum-onnx>=0.1",
-  "plotext>=5.3.2",
+  # plotext 6.0 was recently released with breaking API changes that conflict
+  # with the current live chart code. Upgrade the code and dependency to >=6 together.
+  "plotext>=5.3.2,<6",
   # PINNED EXACTLY ON PURPOSE — do NOT relax to a range.
   # pandas version drift changes parquet string typing/metadata, producing
   # non-functional but huge diffs across every generated rule artifact. If you
@@ -87,9 +89,9 @@ dependencies = [
 
 optional-dependencies.audio = [ "soundfile>=0.13" ]
 optional-dependencies.openvino = [ "openvino>=2023" ]
-optional-dependencies.qnn = [
-  "onnxruntime-qnn>=1.24.1; python_version>='3.11'",
-]
+# QNN is acquired on demand through the architecture-aware Windows ML EP
+# Catalog. Keep the extra as a backwards-compatible installation target.
+optional-dependencies.qnn = []
 urls."Bug Tracker" = "https://github.com/microsoft/winml-cli/issues"
 urls.Documentation = "https://github.com/microsoft/winml-cli/blob/main/README.md"
 urls.Homepage = "https://github.com/microsoft/winml-cli"
@@ -119,20 +121,6 @@ environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
   "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]
-# Overrides:
-# 1. Exercise transformers 5.x in development while keeping the published
-#    `transformers>=4.57` metadata compatible with optimum-onnx 0.1.0's
-#    `transformers<4.58.0` ceiling. The transformers_compat shim bridges the
-#    few 4.x internals optimum-onnx reaches for under transformers 5.
-# 2. Neutralize onnxruntime-qnn's transitive standard `onnxruntime` requirement.
-#    onnxruntime-windowsml ships the same `onnxruntime/` module; installing plain
-#    onnxruntime alongside it overwrites windowsml's files on disk and kills the
-#    DirectML EP. The `sys_platform == 'unobtainium'` marker is never true, so uv
-#    never installs plain onnxruntime while still keeping onnxruntime-qnn.
-override-dependencies = [
-  "transformers>=5,<6",
-  "onnxruntime ; sys_platform == 'unobtainium'",
-]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -149,9 +137,11 @@ torchvision = [
 
 [dependency-groups]
 dev = [
+  # Keep notebook kernels, widgets, and rendering without the jupyter meta-package.
+  # It installs unused JupyterLab/notebook servers whose bundled npm dependencies
+  # carry security vulnerabilities, including in JupyterLab 4.6.3.
   "ipykernel>=6.30.1",
   "ipywidgets>=8.1.7",
-  "jupyter>=1.1.1",
   "markdown-it-py>=3",
   "matplotlib>=3.10",
   "mkdocs-jupyter>=0.25",

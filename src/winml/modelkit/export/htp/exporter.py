@@ -38,7 +38,7 @@ from ...core.onnx_node_tagger import (
     create_node_tagger_from_hierarchy,
 )
 from ...core.onnx_utils import infer_output_names
-from ...transformers_compat import use_eager_attention_for_export
+from .._attention import use_eager_attention_for_export
 from .base_writer import ExportStep
 from .hierarchy import TracingHierarchyBuilder
 from .monitor import HTPExportMonitor
@@ -213,7 +213,10 @@ class HTPExporter:
                     raise ValueError("Either 'model' or 'model_name_or_path' must be provided.")
                 from ...loader import load_hf_model
 
-                model, _, _ = load_hf_model(model_name_or_path)
+                model, _, _ = load_hf_model(
+                    model_name_or_path,
+                    attn_implementation=export_config.compatibility.transformers_attention,
+                )
 
             # Step 1: Model Preparation
             model.eval()
@@ -256,7 +259,10 @@ class HTPExporter:
                 # are traced with the same inputs they are exported with. The export
                 # in Step 4 re-enters the patcher; the contexts are sequential, not
                 # nested.
-                with self._get_optimum_patcher(model, task):
+                with (
+                    self._get_optimum_patcher(model, task),
+                    self._export_compatibility_context(model, export_config),
+                ):
                     self._trace_model_hierarchy(model, inputs)
 
                 execution_steps = (
@@ -416,8 +422,14 @@ class HTPExporter:
 
         self._hierarchy_builder = TracingHierarchyBuilder(exceptions=exceptions)
 
-        # Pass inputs to tracer
-        input_args = inputs
+        # Models with an explicit positional export protocol must use the same
+        # binding for hierarchy tracing and ONNX export. This is particularly
+        # important for wrappers whose ``forward`` accepts only ``*args``.
+        input_args = (
+            model.get_export_args(inputs)  # type: ignore[operator]
+            if hasattr(model, "get_export_args")
+            else inputs
+        )
 
         self._hierarchy_builder.trace_model_execution(model, input_args)
 

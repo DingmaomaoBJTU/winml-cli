@@ -182,6 +182,7 @@ class WinMLCompileConfig:
             "NvTensorRTRTXExecutionProvider": lambda: cls.for_nv_tensorrt_rtx(device=device),
             "OpenVINOExecutionProvider": lambda: cls.for_openvino(device=device),
             "VitisAIExecutionProvider": lambda: cls.for_vitisai(device=device),
+            "WinMLCGExecutionProvider": lambda: cls.for_winmlcg(device=device),
             "MIGraphXExecutionProvider": cls.for_migraphx,
             "CPUExecutionProvider": cls.for_cpu,
         }
@@ -264,6 +265,17 @@ class WinMLCompileConfig:
         return cls(ep_config=ep_cfg)
 
     @classmethod
+    def for_winmlcg(cls, device: str | None = None) -> WinMLCompileConfig:
+        """Factory for Windows ML Compute Graph EP compilation."""
+        return cls(
+            ep_config=EPConfig(
+                provider="winmlcg",
+                enable_ep_context=True,
+                device=device or "gpu",
+            )
+        )
+
+    @classmethod
     def for_vitisai(cls, device: str | None = None) -> WinMLCompileConfig:
         """Factory for Vitis AI (AMD NPU) compilation.
 
@@ -271,11 +283,18 @@ class WinMLCompileConfig:
         when available (target=X1, xclbin=<install>/voe-4.0-win_amd64/
         xclbins/phoenix/4x4.xclbin, xlnx_enable_py3_round=0). VitisAI EP
         ignores ``device_type``; the correct device hint is the xclbin path.
+        The cache is placed under WinML's user-writable cache root instead of
+        VitisAI's installation-relative default, which may resolve through the
+        protected WindowsApps directory and fail during model compilation.
         """
         import os
         from pathlib import Path as _Path
 
-        provider_options: dict[str, str] = {}
+        from ..cache import get_cache_dir
+
+        vaip_cache_dir = (get_cache_dir() / "vitisai").resolve()
+        vaip_cache_dir.mkdir(parents=True, exist_ok=True)
+        provider_options: dict[str, str] = {"cache_dir": str(vaip_cache_dir)}
         provider_option_file_keys: set[str] = set()
         ryzen_ai = os.environ.get("RYZEN_AI_INSTALLATION_PATH")
         if ryzen_ai:

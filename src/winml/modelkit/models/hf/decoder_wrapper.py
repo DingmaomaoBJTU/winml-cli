@@ -35,7 +35,7 @@ knowledge lives in one place.  A per-family subclass only has to:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -43,10 +43,6 @@ from optimum.exporters.onnx import OnnxConfig
 from transformers import PreTrainedModel
 
 from ..winml.kv_cache import WinMLCache, WinMLStaticCache
-
-
-if TYPE_CHECKING:
-    from transformers.cache_utils import CacheLayerMixin
 
 
 class WinMLDecoderWrapper(nn.Module, ABC):
@@ -99,8 +95,26 @@ class WinMLDecoderWrapper(nn.Module, ABC):
         """Order dict inputs positionally to match the IOConfig's input order."""
         return tuple(inputs.values())
 
-    def forward(self, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Execute the three-step adapter.  Subclasses override ``_invoke_hf``."""
+    def forward(
+        self,
+        *args: torch.Tensor,
+        **kwargs: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Execute the three-step adapter. Subclasses override ``_invoke_hf``.
+
+        Accepts either positional args in ONNX input order or keyword args
+        keyed by ONNX input names.
+        """
+        if args and kwargs:
+            raise TypeError("Provide either positional args or keyword args, not both")
+
+        if kwargs:
+            input_order = list(self.onnx_config.inputs.keys())
+            missing = [name for name in input_order if name not in kwargs]
+            if missing:
+                raise TypeError(f"Missing decoder input(s): {missing}")
+            args = tuple(kwargs[name] for name in input_order)
+
         inputs = dict(zip(self.onnx_config.inputs.keys(), args, strict=True))
 
         # 1. Create cache aliased to ONNX past-KV inputs.
@@ -146,10 +160,7 @@ class WinMLDecoderWrapper(nn.Module, ABC):
         # an op on the named graph input — that's how the cache becomes
         # "visible" at the ONNX boundary.
         for i, (key_name, value_name) in enumerate(zip(key_names, value_names, strict=True)):
-            # ``Cache.layers`` is typed as a union including
-            # ``LinearAttentionCacheLayerMixin`` (no keys/values); a WinML static
-            # cache always holds ``CacheLayerMixin`` layers, so narrow the type.
-            layer = cast("CacheLayerMixin", cache.layers[i])
+            layer = cache.layers[i]
             layer.keys = inputs[key_name]
             layer.values = inputs[value_name]
         position = inputs.get(cache.position_input_name)

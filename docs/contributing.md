@@ -8,7 +8,7 @@ For the full contributing guide — development setup, coding conventions, testi
 # Clone and set up
 git clone https://github.com/microsoft/winml-cli.git
 cd winml-cli
-uv sync --locked
+uv sync
 uv run pre-commit install
 
 # Download runtime check rules (required for `winml analyze`)
@@ -28,5 +28,8 @@ uv run mkdocs serve
 
 ## See also
 
+- [Add model support with an AI agent](getting-started/agent-skill/adding-model-support.md) — use
+  the contribution skill to diagnose, implement, validate, and review support
+  for one model
 - [Installation](getting-started/installation.md) — user-facing setup
 - [Commands](commands/overview.md) — CLI reference

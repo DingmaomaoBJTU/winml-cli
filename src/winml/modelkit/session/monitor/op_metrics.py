@@ -44,6 +44,7 @@ class TraceFallbackReason(StrEnum):
     SCHEMATIC_PUBLISH_FAILED = "schematic_publish_failed"
     QHAS_OUTPUT_MISSING = "qhas_output_missing"
     QHAS_PARSE_FAILED = "qhas_parse_failed"
+    MULTIPLE_PARTITIONS = "multiple_partitions"
 
 
 @dataclass
@@ -93,6 +94,7 @@ class OperatorMetrics:
     onnx_attributes: dict[str, Any] | None = None
     onnx_inputs: dict[str, dict[str, Any]] | None = None
     onnx_outputs: dict[str, dict[str, Any]] | None = None
+    onnx_nodes: list[dict[str, str | None]] | None = None
 
     @property
     def sample_count(self) -> int:
@@ -124,7 +126,7 @@ class OperatorMetrics:
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict, omitting only unset opt-in ONNX metadata."""
         result = asdict(self)
-        for key in ("onnx_op_type", "onnx_attributes", "onnx_inputs", "onnx_outputs"):
+        for key in ("onnx_op_type", "onnx_attributes", "onnx_inputs", "onnx_outputs", "onnx_nodes"):
             if result[key] is None:
                 del result[key]
         return result

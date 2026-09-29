@@ -190,6 +190,26 @@ class TestSysJsonShape:
                 f"Device priorities are not sequential 1..N: {priorities}"
             )
 
+    def test_default_json_devices_include_luid(self):
+        data = _run_sys_json()
+        for device in data["devices"]:
+            assert "luid" in device["details"]
+            luid = device["details"]["luid"]
+            assert luid is None or re.fullmatch(
+                r"0x[0-9A-F]{8}_0x[0-9A-F]{8}", luid
+            )
+
+    def test_default_json_accelerators_include_memory(self):
+        data = _run_sys_json()
+        for device in data["devices"]:
+            if device["type"] not in ("NPU", "GPU"):
+                continue
+            details = device["details"]
+            for field in ("dedicated_memory_mib", "shared_memory_mib"):
+                assert field in details
+                value = details[field]
+                assert value is None or (isinstance(value, int) and value >= 0)
+
     def test_default_json_eps_have_source_entries(self):
         data = _run_sys_json()
         eps = data["executionProviders"]

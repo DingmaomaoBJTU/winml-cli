@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -18,8 +20,6 @@ from winml.modelkit.export.policy import ExportCompatibilityConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 class _AttentionConfig:
@@ -140,6 +140,28 @@ def _export_config(*, eager_attention: bool) -> WinMLExportConfig:
         compatibility=ExportCompatibilityConfig(
             transformers_attention="eager" if eager_attention else None
         ),
+    )
+
+
+def test_htp_exporter_auto_load_threads_attention_compatibility(tmp_path: Path) -> None:
+    export_config = _export_config(eager_attention=True)
+
+    with patch("winml.modelkit.loader.load_hf_model") as mock_load:
+        mock_load.side_effect = RuntimeError("stop after model loading")
+        try:
+            HTPExporter().export(
+                output_path=str(tmp_path / "model.onnx"),
+                export_config=export_config,
+                model_name_or_path="fake/model",
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "stop after model loading"
+        else:
+            raise AssertionError("Expected the loader sentinel to stop export")
+
+    mock_load.assert_called_once_with(
+        "fake/model",
+        attn_implementation="eager",
     )
 
 
@@ -297,3 +319,68 @@ def test_htp_exporter_leaves_attention_unchanged_without_policy(
     assert captured == {"root": "sdpa", "child": "sdpa"}
     assert model.config._attn_implementation == "sdpa"
     assert model.proj.config._attn_implementation == "sdpa"
+
+
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool, torch.float32])
+def test_export_context_normalizes_sdpa_masks(positional: bool, dtype: torch.dtype) -> None:
+    model = _NestedAttentionModel()
+    query = torch.randn(1, 2, 3, 4)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    mask = torch.randint(0, 2, (1, 1, 3, 3)).to(dtype)
+    original_sdpa = torch.nn.functional.scaled_dot_product_attention
+    expected_mask = mask if dtype.is_floating_point else mask.to(torch.bool)
+    expected = original_sdpa(query, key, value, attn_mask=expected_mask)
+
+    with HTPExporter()._export_compatibility_context(model, _export_config(eager_attention=True)):
+        sdpa = torch.nn.functional.scaled_dot_product_attention
+        actual = (
+            sdpa(query, key, value, mask)
+            if positional
+            else sdpa(query, key, value, attn_mask=mask)
+        )
+        assert model.config._attn_implementation == "eager"
+
+    torch.testing.assert_close(actual, expected)
+    assert torch.nn.functional.scaled_dot_product_attention is original_sdpa
+    assert model.config._attn_implementation == "sdpa"
+
+
+def test_export_context_restores_sdpa_after_failure() -> None:
+    model = _NestedAttentionModel()
+    original_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+    # Keep exception suppression explicit for CodeQL's control-flow analysis.
+    with pytest.raises(RuntimeError, match="export failed"):  # noqa: SIM117
+        with HTPExporter()._export_compatibility_context(
+            model, _export_config(eager_attention=True)
+        ):
+            raise RuntimeError("export failed")
+
+    assert torch.nn.functional.scaled_dot_product_attention is original_sdpa
+    assert model.config._attn_implementation == "sdpa"
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool])
+@pytest.mark.parametrize("resolve_specs", [False, True])
+def test_io_resolution_preserves_generator_mask_dtype(
+    dtype: torch.dtype, resolve_specs: bool
+) -> None:
+    from winml.modelkit.export import generate_dummy_inputs, resolve_io_specs
+
+    mask = torch.randint(0, 2, (1, 8)).to(dtype)
+    onnx_config = MagicMock()
+    onnx_config.inputs = {"attention_mask": {0: "batch", 1: "sequence"}}
+    onnx_config.outputs = {"output": {0: "batch"}}
+    onnx_config.generate_dummy_inputs.return_value = {"attention_mask": mask}
+    hf_config = MagicMock(max_position_embeddings=8)
+
+    with patch("winml.modelkit.export.io._get_onnx_config", return_value=onnx_config):
+        if resolve_specs:
+            specs = resolve_io_specs("fake", "feature-extraction", hf_config)
+            assert specs["input_dtypes"] == [str(dtype).removeprefix("torch.")]
+        else:
+            inputs = generate_dummy_inputs("fake", "feature-extraction", hf_config)
+            assert inputs["attention_mask"].dtype == dtype
+            torch.testing.assert_close(inputs["attention_mask"], mask)

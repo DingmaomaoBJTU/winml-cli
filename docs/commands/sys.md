@@ -30,13 +30,33 @@ $ winml sys [options]
 ## How it works
 
 `winml sys` queries Python's `platform` and `importlib.metadata` modules to report
-library versions, then probes PyTorch for CUDA availability and GPU device names.
-Backend availability checks use the installed runtime environment, while device
-enumeration queries hardware directly in NPU > GPU > CPU priority order, and EP
-enumeration merges the WinML EP registry with ONNX Runtime's
+library versions. On Windows, it also reads the native
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion` registry key to report the
+display version, build, update build revision (UBR), build branch, and build lab.
+It then probes PyTorch for CUDA availability and GPU device names.
+Backend availability checks use the installed runtime environment. GPU and NPU
+enumeration uses DXCore as the source of adapter identity and LUID, then enriches
+those native rows with WMI/PnP driver and manufacturer details. NPU and GPU rows also
+report DXCore's 64-bit dedicated adapter memory and shared system memory
+capacities in MiB. CPU enumeration uses WMI. Devices remain in NPU > GPU > CPU
+priority order, and EP enumeration
+merges the WinML EP registry with ONNX Runtime's
 `get_available_providers()`. When
 `--format json` is used the full report — including devices and EPs — is emitted as
 a single JSON object, making it easy to capture in CI pipelines.
+
+Within the GPU class, devices are ordered by ONNX Runtime hardware metadata
+`DxgiHighPerformanceIndex` numerically (0 first), with LUID as a stable
+tie-breaker. This is the Windows DXGI high-performance preference, not DXCore
+enumeration order. The preference is joined to native DXCore rows by LUID;
+EP metadata never adds or removes physical adapters. Missing or invalid ranks
+sort after ranked GPUs, in LUID order. If EP probing cannot supply ranks, all
+native GPUs fall back to LUID order.
+
+Unpinned runtime GPU selection uses the same ordering within the selected EP
+source's exposed devices. An EP that exposes only a subset of installed GPUs
+can therefore select a different GPU from the first system-wide row. An explicit
+`--device-luid` on `winml perf` overrides that preference.
 
 ## Examples
 
@@ -55,6 +75,11 @@ Environment
   Python Executable C:\...\python.exe
   OS                Windows 11
   Machine           AMD64
+  Display Version   24H2
+  Current Build     26100
+  UBR               4946
+  Build Branch      ge_release
+  BuildLabEx        26100.1.amd64fre.ge_release.240331-1435
 
 ML Libraries
   Library        Version   Status
@@ -65,8 +90,13 @@ ML Libraries
 
 Available Devices (priority order)
   #1  NPU   Qualcomm(R) Hexagon NPU
+             LUID: 0x00000000_0x00018393 | Driver: 1.0.0 | Manufacturer: Qualcomm
+             Dedicated memory: 0 MiB | Shared memory: 8192 MiB
   #2  GPU   Qualcomm(R) Adreno GPU
+             LUID: 0x00000000_0x00018394 | Driver: 1.0.0 | Manufacturer: Qualcomm
+             Dedicated memory: 1024 MiB | Shared memory: 8192 MiB
   #3  CPU   Snapdragon(R) X Elite
+             LUID: N/A | Cores: 12 | Threads: 12 | Architecture: ARM64
 
 Available Execution Providers
   QNNExecutionProvider           -> NPU/GPU
