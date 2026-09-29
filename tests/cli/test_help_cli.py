@@ -150,19 +150,6 @@ class TestWinmlHelp:
         assert result.exit_code == 0
         assert "Windows ML" not in result.stderr
 
-    @pytest.mark.parametrize(
-        ("style", "marker"),
-        [
-            ("capsule", "┏"),
-            ("tiles", "██ ██"),
-            ("prompt", ">_"),
-        ],
-    )
-    def test_banner_style_can_be_selected(self, style: str, marker: str) -> None:
-        result = _invoke("--banner-style", style, "--help")
-        assert result.exit_code == 0
-        assert marker in result.stderr
-
     def test_banner_animation_is_skipped_outside_interactive_terminals(self) -> None:
         with patch("time.sleep") as mock_sleep:
             _print_banner(
@@ -175,13 +162,11 @@ class TestWinmlHelp:
             )
             mock_sleep.assert_not_called()
 
-    @pytest.mark.parametrize("style", ["capsule", "tiles", "prompt"])
     @pytest.mark.parametrize("width", [80, 81, 82, 100])
-    def test_interactive_banner_is_static(self, style: str, width: int) -> None:
+    def test_interactive_banner_is_static(self, width: int) -> None:
         with patch("time.sleep") as mock_sleep:
             _print_banner(
                 "1.2.3",
-                style,
                 _console=Console(
                     file=StringIO(),
                     force_terminal=True,
@@ -191,27 +176,27 @@ class TestWinmlHelp:
             )
             mock_sleep.assert_not_called()
 
-    def test_unknown_banner_style_is_rejected(self) -> None:
+    def test_removed_banner_style_is_rejected(self) -> None:
         result = _invoke("--banner-style", "unknown", "--help")
         assert result.exit_code != 0
-        assert "Invalid value for '--banner-style'" in result.output
+        assert "No such option" in result.output
 
     # Each row contains two four-column gradient tiles separated by a gap.
     _MARK_SIGNATURE = "████████  ████████"
 
     def test_capsule_shows_left_mark_on_wide_terminals(self) -> None:
         console = Console(file=StringIO(), force_terminal=False, color_system=None, width=90)
-        _print_banner("1.2.3", "capsule", _console=console)
+        _print_banner("1.2.3", _console=console)
         assert self._MARK_SIGNATURE in console.file.getvalue()
 
     def test_capsule_hides_left_mark_on_narrow_terminals(self) -> None:
         console = Console(file=StringIO(), force_terminal=False, color_system=None, width=80)
-        _print_banner("1.2.3", "capsule", _console=console)
+        _print_banner("1.2.3", _console=console)
         assert self._MARK_SIGNATURE not in console.file.getvalue()
 
     def test_capsule_places_version_inside_frame(self) -> None:
         console = Console(file=StringIO(), force_terminal=False, color_system=None, width=110)
-        _print_banner("1.2.3", "capsule", _console=console)
+        _print_banner("1.2.3", _console=console)
         output = console.file.getvalue()
         version_line = next(line for line in output.splitlines() if "v1.2.3" in line)
         assert version_line.strip().startswith("┃")
@@ -393,7 +378,7 @@ class TestOptionsSection:
 
     @pytest.mark.parametrize(
         "opt",
-        ["--version", "--verbose", "-v", "--quiet", "-q", "--banner-style", "--help", "-h"],
+        ["--version", "--verbose", "-v", "--quiet", "-q", "--help", "-h"],
     )
     def test_option_present(self, opt: str) -> None:
         assert opt in _invoke("--help").output
