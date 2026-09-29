@@ -34,7 +34,7 @@ from winml.modelkit.commands.sys import (
     _get_memory_info,
     _render_compact,
 )
-from winml.modelkit.sysinfo import DXCoreAdapterInfo
+from winml.modelkit.sysinfo import DXCoreAdapterInfo, format_pdh_luid
 
 
 @pytest.fixture(autouse=True)
@@ -86,6 +86,68 @@ def _fake_ep_info(
 
 class TestDeviceInfoEnrichment:
     """``_gather_device_info`` folds device_facts from ep_info into details."""
+
+    @pytest.mark.parametrize("reverse_metadata", [False, True])
+    @pytest.mark.parametrize("with_ep_info", [False, True])
+    def test_gpu_ranking_preserves_native_inventory_and_joins_only_by_luid(
+        self, reverse_metadata: bool, with_ep_info: bool
+    ) -> None:
+        adapters = [
+            DXCoreAdapterInfo(
+                device_type="GPU",
+                name="Identical GPU",
+                luid=format_pdh_luid(str(index)),
+                vendor_id=0x1234,
+                device_id=0x5678,
+                dedicated_memory_mib=index * 1024,
+                shared_memory_mib=16 * 1024,
+            )
+            for index in range(1, 4)
+        ]
+        ranked_luid = adapters[-1].luid
+        metadata = [
+            ("GPU", ranked_luid.swapcase(), "10"),
+            ("GPU", ranked_luid, "invalid"),
+            ("GPU", format_pdh_luid(str(len(adapters) + 1)), "0"),
+            ("NPU", adapters[1].luid, "0"),
+            ("GPU", None, "0"),
+        ]
+        sources = [
+            {
+                "devices": [
+                    {
+                        "device_type": device_type,
+                        "hardware_name": adapters[0].name,
+                        "luid": luid,
+                        "high_performance_index": rank,
+                    }
+                ]
+            }
+            for device_type, luid, rank in metadata
+        ]
+        ep_info = {
+            "OpenVINOExecutionProvider": {"entries": sources[::-1] if reverse_metadata else sources}
+        }
+        with (
+            patch(
+                "winml.modelkit.sysinfo.enumerate_compute_adapters",
+                return_value=adapters[::-1],
+            ),
+            patch("winml.modelkit.sysinfo.GPU.get_all", return_value=[]),
+            patch("winml.modelkit.sysinfo.NPU.get_all", return_value=[]),
+            patch("winml.modelkit.sysinfo.CPU.get_all", return_value=[]),
+        ):
+            result = _gather_device_info(ep_info if with_ep_info else None)
+
+        expected = [adapters[-1], *adapters[:-1]] if with_ep_info else adapters
+        assert [row["details"]["luid"] for row in result] == [adapter.luid for adapter in expected]
+        assert [row["details"]["dedicated_memory_mib"] for row in result] == [
+            adapter.dedicated_memory_mib for adapter in expected
+        ]
+        assert [row["details"]["shared_memory_mib"] for row in result] == [
+            adapter.shared_memory_mib for adapter in expected
+        ]
+        assert [row["priority"] for row in result] == list(range(1, len(adapters) + 1))
 
     def test_device_info_enriched_with_winml_device_facts(self) -> None:
         """A matching per-source device contributes architecture to details."""
@@ -188,28 +250,28 @@ class TestDeviceInfoEnrichment:
         ]
         assert all(entry["details"]["driver"] == "1.0" for entry in result)
 
-    def test_dxcore_accelerator_survives_wmi_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_dxcore_accelerator_survives_wmi_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Native identity remains visible when descriptive enrichment fails."""
-        native_gpu = DXCoreAdapterInfo(
-            device_type="GPU",
-            name="Example GPU",
+        native_npu = DXCoreAdapterInfo(
+            device_type="NPU",
+            name="Example NPU",
             luid="0x00000000_0x00000001",
             vendor_id=0x1234,
             device_id=0x5678,
+            dedicated_memory_mib=0,
+            shared_memory_mib=16384,
         )
         monkeypatch.setattr(
             "winml.modelkit.sysinfo.enumerate_compute_adapters",
-            lambda: [native_gpu],
+            lambda: [native_npu],
         )
 
         with (
-            patch("winml.modelkit.sysinfo.NPU.get_all", return_value=[]),
             patch(
-                "winml.modelkit.sysinfo.GPU.get_all",
+                "winml.modelkit.sysinfo.NPU.get_all",
                 side_effect=RuntimeError("WMI unavailable"),
             ),
+            patch("winml.modelkit.sysinfo.GPU.get_all", return_value=[]),
             patch("winml.modelkit.sysinfo.CPU.get_all", return_value=[]),
         ):
             result = _gather_device_info()
@@ -217,12 +279,14 @@ class TestDeviceInfoEnrichment:
         assert result == [
             {
                 "priority": 1,
-                "type": "GPU",
-                "name": "Example GPU",
+                "type": "NPU",
+                "name": "Example NPU",
                 "details": {
                     "driver": None,
                     "manufacturer": None,
                     "luid": "0x00000000_0x00000001",
+                    "dedicated_memory_mib": 0,
+                    "shared_memory_mib": 16384,
                 },
             }
         ]
@@ -230,7 +294,9 @@ class TestDeviceInfoEnrichment:
     def test_device_info_first_match_wins(self) -> None:
         """When multiple sources see the same device, first one in ep_info wins."""
         npu_item = MagicMock(
-            name="Intel(R) AI Boost", driver_version=None, manufacturer="Intel",
+            name="Intel(R) AI Boost",
+            driver_version=None,
+            manufacturer="Intel",
         )
         npu_item.name = "Intel(R) AI Boost"
 
@@ -294,6 +360,7 @@ class TestDeviceInfoEnrichment:
         assert result[0]["details"]["luid"] is None
         assert "architecture" not in result[0]["details"]
 
+
 class TestMemoryInfo:
     """System memory metadata is fast, explicit, and best-effort."""
 
@@ -350,6 +417,35 @@ def test_compact_device_output_includes_luid(
     output = capsys.readouterr().out
     assert "GPU: Test GPU (LUID: 0x00000000_0x00018393)" in output
     assert "CPU: Test CPU (LUID: N/A)" in output
+
+
+@pytest.mark.parametrize("device_type", ["NPU", "GPU"])
+def test_accelerator_text_output_includes_dedicated_and_shared_memory(
+    device_type: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from winml.modelkit.commands.sys import _output_device_text
+
+    _output_device_text(
+        [
+            {
+                "priority": 1,
+                "type": device_type,
+                "name": f"Test {device_type}",
+                "details": {
+                    "luid": "0x00000000_0x00018393",
+                    "driver": "1.0",
+                    "manufacturer": "Example",
+                    "dedicated_memory_mib": 8192,
+                    "shared_memory_mib": 16384,
+                },
+            }
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "Dedicated memory: 8192 MiB" in output
+    assert "Shared memory: 16384 MiB" in output
 
 
 class TestGatherDeviceSectionEnrichment:

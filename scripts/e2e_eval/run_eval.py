@@ -5,6 +5,20 @@
 
 """E2E evaluation runner — unified, recipe-driven perf + accuracy.
 
+``--release`` reads ``testsets/models_release_validation.json`` and builds one
+job per selected model/task using the target EP's selected config precision.
+Recipe filenames follow their quant config; a matching recipe is built unchanged.
+The config label is not a measurement of the artifact's numerical precision.
+Without a matching recipe the build uses ``winml config``;
+this fallback does not establish equivalence to the historical configuration.
+``default`` omits the precision flag without expanding NPU variants. Without
+``--release``, the existing P0-P3 selection and recipe expansion below apply.
+
+Explicit ``--ep`` / ``--device`` pairs are checked against locally discovered
+runtime devices before loading models. Unavailable targets print ``[SKIP]``
+and exit successfully without installing EPs. Listing, build-only, and baseline
+update modes do not require the target hardware.
+
 Batch-builds models and runs winml perf, then (when perf passes) winml eval,
 writing one unified eval_result.json per (model, task, precision). Recipes drive
 the build on every device (they carry the accuracy eval/dataset config), but
@@ -24,6 +38,9 @@ scripts from these eval_result.json files. Use ``--update-baseline`` to refresh
 the offline baseline cache the site grades against.
 
 Usage:
+    # Explicit release set at the target EP's chosen precision
+    python scripts/e2e_eval/run_eval.py --release --ep openvino --device gpu --eval-type both
+
     # Perf only (default), recipe-driven across precision variants
     python scripts/e2e_eval/run_eval.py --priority P0
 
@@ -56,7 +73,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -73,6 +89,7 @@ from utils.registry import (
     ModelEntry,
     filter_registry,
     load_registry,
+    load_release_registry,
     make_adhoc_entry,
     op_tracing_target_key,
 )
@@ -95,10 +112,18 @@ logger = logging.getLogger(__name__)
 WINML_CLI = [sys.executable, "-m", "winml.modelkit.cli"]
 BASELINE_SCRIPT = Path(__file__).parent / "run_pytorch_baseline.py"
 BASELINE_CACHE_PATH = Path(__file__).parent / "cache" / "baseline_cache.json"
+_RELEASE_MANIFEST = Path(__file__).parent / "testsets" / "models_release_validation.json"
 EVAL_DATASETS_CACHE = Path.home() / ".cache" / "winml" / "eval_datasets"
 TIMEOUT_SKIP_LIST_PATH = Path(__file__).parent / "cache" / "timeout_skip_list.json"
 _DEFAULT_SAMPLES = 1000
 _DEFAULT_PRECISION_NPU = "w8a16"
+_DEFAULT_HF_DOWNLOAD_STALL_TIMEOUT = 120
+_HF_DOWNLOAD_STALL_TIMEOUT = float(_DEFAULT_HF_DOWNLOAD_STALL_TIMEOUT)
+_SUBPROCESS_POLL_INTERVAL = 0.25
+_HF_DOWNLOAD_MONITOR_TIMEOUT = 5.0
+_SUBPROCESS_HEARTBEAT_INTERVAL = 30.0
+_SUBPROCESS_LOG_ROOT = Path(__file__).resolve().parents[2] / "temp" / "e2e-eval-logs"
+_PRIORITY_RANK = {f"P{index}": index for index in range(4)}
 _RETRY_FAILED_TYPES = (
     *(failure_type.value for failure_type in FailureType),
     "FAIL",
@@ -156,6 +181,32 @@ def _resolve_eval_target(ep: str | None, device: str | None) -> tuple[str, str]:
 
     target = resolve_device(EPDeviceTarget(ep=ep or "auto", device=device or "auto"))
     return target.ep, target.device
+
+
+def _is_eval_target_available(ep: str | None, device: str | None) -> bool:
+    """Check an explicit EP/device pair against the host's runtime inventory."""
+    if not ep or ep.lower() == "auto" or not device or device.lower() == "auto":
+        return True
+
+    from winml.modelkit.session import (
+        DeviceNotFound,
+        EPDeviceTarget,
+        WinMLEPNotDiscovered,
+        WinMLEPRegistrationFailed,
+        WinMLEPRegistry,
+        expand_ep_name,
+    )
+
+    target = EPDeviceTarget(ep=ep, device=device)
+    try:
+        registry = WinMLEPRegistry.instance()
+        if expand_ep_name(target.ep) not in registry.available_eps():
+            raise WinMLEPNotDiscovered(f"No locally installed EP found for {target.ep}.")
+        registry.auto_device(target)
+    except (DeviceNotFound, WinMLEPNotDiscovered, WinMLEPRegistrationFailed) as exc:
+        safe_print(f"[SKIP] {target.ep}/{target.device} is not available on this machine: {exc}")
+        return False
+    return True
 
 
 def _validate_recipe_copy_target(ep: str | None, device: str | None) -> None:
@@ -486,9 +537,14 @@ def _clean_stray_cwd_artifacts(directory: Path) -> int:
 def safe_print(text: str) -> None:
     """Cross-platform safe print (handles Windows Unicode issues)."""
     try:
-        print(text)
+        print(text, flush=True)
     except UnicodeEncodeError:
-        print(text.encode("ascii", errors="replace").decode("ascii"))
+        print(text.encode("ascii", errors="replace").decode("ascii"), flush=True)
+
+
+def _progress_prefix(index: int, total: int, now: datetime | None = None) -> str:
+    timestamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    return f"[{timestamp}] [{index}/{total}]"
 
 
 def _utc_now() -> str:
@@ -606,10 +662,13 @@ def _kill_process_tree(pid: int) -> None:
 
     # Fallback: taskkill on Windows, killpg on Unix
     if platform.system() == "Windows":
-        subprocess.run(  # noqa: S603
-            ["taskkill", "/F", "/T", "/PID", str(pid)],  # noqa: S607
-            capture_output=True,
-        )
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            subprocess.run(  # noqa: S603
+                ["taskkill", "/F", "/T", "/PID", str(pid)],  # noqa: S607
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
     else:
         import signal
 
@@ -619,110 +678,428 @@ def _kill_process_tree(pid: int) -> None:
             pass  # Process already exited; nothing to kill
 
 
-def _run_subprocess(args: list[str], timeout: int) -> dict:
-    """Run a subprocess with three-layer timeout protection.
+def _expand_cache_path(path: str | os.PathLike[str]) -> Path:
+    return Path(os.path.expandvars(os.fspath(path))).expanduser()
 
-    Returns a dict with: stdout, stderr, exit_code, elapsed, timeout, command.
 
-    Windows fix: On Windows, child processes can inherit pipe handles, causing
-    ``proc.communicate()`` to block indefinitely even after ``taskkill`` kills
-    the process tree.  We work around this by:
-    1. Using ``CREATE_NO_WINDOW`` to prevent console inheritance issues.
-    2. Reading stdout/stderr in background threads so the main thread can
-       enforce the timeout independently of pipe EOF.
-    3. Using a hard watchdog timer that forcefully closes pipes.
-    """
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    start = time.perf_counter()
-    timed_out = False
-
-    popen_kwargs: dict = {
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "env": env,
-    }
-    if platform.system() == "Windows":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+def _hf_cache_roots(env: dict[str, str]) -> tuple[Path, Path, Path]:
+    """Resolve cache roots using Hugging Face's environment precedence."""
+    if "HF_HOME" in env:
+        hf_home = _expand_cache_path(env["HF_HOME"])
     else:
-        popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(args, **popen_kwargs)  # noqa: S603
+        xdg_cache = _expand_cache_path(env.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        hf_home = xdg_cache / "huggingface"
 
-    # Read pipes in background threads so communicate() timeout works even
-    # when grandchild processes keep pipe handles alive (Windows issue).
-    stdout_chunks: list[bytes] = []
-    stderr_chunks: list[bytes] = []
+    hub_cache_value = env.get("HF_HUB_CACHE")
+    if hub_cache_value is None:
+        hub_cache_value = env.get("HUGGINGFACE_HUB_CACHE")
+    hub_cache = _expand_cache_path(hub_cache_value or hf_home / "hub")
+    datasets_cache = _expand_cache_path(env.get("HF_DATASETS_CACHE") or hf_home / "datasets")
+    xet_cache = _expand_cache_path(env.get("HF_XET_CACHE") or hf_home / "xet")
+    return hub_cache, datasets_cache, xet_cache
 
-    def _reader(pipe, dest: list[bytes]) -> None:
-        try:
-            while True:
-                chunk = pipe.read(8192)
-                if not chunk:
-                    break
-                dest.append(chunk)
-        except (OSError, ValueError):
-            pass  # Pipe closed or broken; stop reading
 
-    stdout_thread = threading.Thread(target=_reader, args=(proc.stdout, stdout_chunks), daemon=True)
-    stderr_thread = threading.Thread(target=_reader, args=(proc.stderr, stderr_chunks), daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-
-    def _watchdog() -> None:
-        try:
-            _kill_process_tree(proc.pid)
-            proc.kill()
-            for pipe in (proc.stdout, proc.stderr):
-                if pipe:
+def _snapshot_hf_downloads(env: dict[str, str]) -> dict[Path, tuple[int, int]]:
+    """Return observable Hugging Face partial downloads as size/mtime pairs."""
+    hub_cache, datasets_cache, xet_cache = _hf_cache_roots(env)
+    searches = (
+        (hub_cache, ("*/blobs/*.incomplete", "*.incomplete")),
+        (datasets_cache, ("downloads/*.incomplete",)),
+        (xet_cache, ("**/*.incomplete",)),
+    )
+    snapshot: dict[Path, tuple[int, int]] = {}
+    for root, patterns in searches:
+        if not root.is_dir():
+            continue
+        for pattern in patterns:
+            try:
+                candidates = root.glob(pattern)
+                for path in candidates:
                     try:
-                        pipe.close()
+                        stat = path.stat()
                     except OSError:
-                        pass  # Pipe already closed
-        except Exception:
-            pass  # Best-effort cleanup; ignore all errors in watchdog
+                        continue
+                    snapshot[path] = (stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                continue
+    return snapshot
 
-    watchdog = threading.Timer(timeout + 30, _watchdog)
-    watchdog.daemon = True
-    watchdog.start()
+
+def _normalized_path(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.realpath(os.fspath(path)))
+
+
+def _process_tree_open_paths(pid: int) -> set[str]:
+    """Return normalized paths opened by a process and its descendants."""
+    try:
+        import psutil
+    except ImportError:
+        return set()
 
     try:
-        proc.wait(timeout=timeout)
-        exit_code = proc.returncode
-        # Give reader threads a moment to finish draining
-        stdout_thread.join(timeout=10)
-        stderr_thread.join(timeout=10)
-    except subprocess.TimeoutExpired:
-        _kill_process_tree(proc.pid)
-        proc.kill()
-        # Give threads a short time to drain after kill
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        exit_code = -1
-        timed_out = True
-    except KeyboardInterrupt:
-        safe_print("\n  [Ctrl+C] Killing subprocess...")
-        _kill_process_tree(proc.pid)
-        proc.kill()
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        raise
-    finally:
-        watchdog.cancel()
-        # Force-close pipes to unblock any stuck reader threads
-        for pipe in (proc.stdout, proc.stderr):
-            if pipe:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass  # Pipe already closed
-        # Final attempt: if reader threads are still alive after pipe close,
-        # don't block forever — just proceed with whatever was collected.
-        if stdout_thread.is_alive():
-            stdout_thread.join(timeout=2)
-        if stderr_thread.is_alive():
-            stderr_thread.join(timeout=2)
+        root = psutil.Process(pid)
+    except psutil.Error:
+        return set()
 
-    stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
-    stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+    processes = [root]
+    with contextlib.suppress(psutil.Error):
+        processes.extend(root.children(recursive=True))
+
+    paths: set[str] = set()
+    for process in processes:
+        try:
+            open_files = process.open_files()
+        except psutil.Error:
+            continue
+        paths.update(_normalized_path(open_file.path) for open_file in open_files)
+    return paths
+
+
+class _HfDownloadTracker:
+    """Detect downloads owned by the monitored subprocess tree."""
+
+    def __init__(self, env: dict[str, str], now: float) -> None:
+        self._env = env
+        self._previous: dict[Path, tuple[int, int]] = {}
+        self._active_paths: set[Path] = set()
+        self._pid: int | None = None
+        self.last_progress = now
+
+    def bind(self, pid: int) -> None:
+        self._pid = pid
+
+    def poll(self, now: float) -> bool:
+        open_paths = _process_tree_open_paths(self._pid) if self._pid is not None else set()
+        current = _snapshot_hf_downloads(self._env)
+        progressed = {
+            path
+            for path, state in current.items()
+            if self._previous.get(path) != state and _normalized_path(path) in open_paths
+        }
+        if progressed:
+            self._active_paths.update(progressed)
+            self.last_progress = max(now, time.perf_counter())
+        self._active_paths.intersection_update(
+            path for path in current if _normalized_path(path) in open_paths
+        )
+        self._previous = current
+        return bool(self._active_paths)
+
+
+_HF_DOWNLOAD_MONITOR_CODE = "\n".join(
+    (
+        "import sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, sys.argv[1])",
+        "from run_eval import _monitor_hf_downloads",
+        "_monitor_hf_downloads(int(sys.argv[2]), Path(sys.argv[3]))",
+    )
+)
+
+
+def _monitor_hf_downloads(pid: int, progress_path: Path) -> None:
+    """Publish download observations outside the timeout-enforcing interpreter."""
+    import psutil
+
+    tracker = _HfDownloadTracker(dict(os.environ), time.perf_counter())
+    tracker.bind(pid)
+    pending_path = progress_path.with_suffix(".tmp")
+    while psutil.pid_exists(pid):
+        active = tracker.poll(time.perf_counter())
+        snapshot = {
+            "observed_at": time.perf_counter(),
+            "active": active,
+            "last_progress": tracker.last_progress,
+        }
+        with contextlib.suppress(OSError):
+            pending_path.write_text(json.dumps(snapshot), encoding="utf-8")
+            pending_path.replace(progress_path)
+        time.sleep(_SUBPROCESS_POLL_INTERVAL)
+
+
+def _start_hf_download_monitor(
+    pid: int, env: dict[str, str], progress_path: Path
+) -> subprocess.Popen:
+    kwargs: dict = {
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    with (progress_path.parent / "monitor.log").open("wb") as monitor_log:
+        kwargs["stderr"] = monitor_log
+        return subprocess.Popen(  # noqa: S603
+            [
+                sys.executable,
+                "-c",
+                _HF_DOWNLOAD_MONITOR_CODE,
+                str(Path(__file__).parent),
+                str(pid),
+                str(progress_path),
+            ],
+            **kwargs,
+        )
+
+
+def _run_subprocess(args: list[str], timeout: int) -> dict:
+    """Run a subprocess with execution and HF-download-stall timeouts.
+
+    ``timeout`` starts normally when no Hugging Face download is observed. If a
+    Hub download starts, the execution budget is suspended and reset to its
+    full value after the download completes. Downloads get an independent
+    inactivity budget: if an ``*.incomplete`` cache file stops changing for
+    ``_HF_DOWNLOAD_STALL_TIMEOUT`` seconds, the process is terminated as an HF
+    fetch failure.
+
+    Output goes directly to retained log files so thread startup, full pipes and
+    inherited pipe handles cannot block the timeout loop or output cleanup.
+    Download scans run in a separate process; missing or stale observations
+    disable download suspension after ``_HF_DOWNLOAD_MONITOR_TIMEOUT`` seconds.
+    """
+    env = {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONFAULTHANDLER": "1",
+        "HF_HUB_DOWNLOAD_TIMEOUT": str(int(_HF_DOWNLOAD_STALL_TIMEOUT)),
+        "HF_HUB_ETAG_TIMEOUT": str(int(_HF_DOWNLOAD_STALL_TIMEOUT)),
+    }
+    start = time.perf_counter()
+    timed_out = False
+    hf_download_stalled = False
+    execution_elapsed = 0.0
+    last_poll = start
+    download_was_active = False
+    last_download_progress = start
+    last_download_observation = start
+    download_state_known = False
+    download_monitor_stalled = False
+    last_heartbeat = start
+    last_output_progress = start
+    last_output_sizes = (0, 0)
+    stage = Path(args[0]).name
+    if len(args) > 3 and args[1:3] == ["-m", "winml.modelkit.cli"]:
+        stage = args[3]
+    elif len(args) > 1 and str(args[1]).endswith(".py"):
+        stage = Path(args[1]).name
+    _SUBPROCESS_LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"{datetime.now():%Y%m%d-%H%M%S}-{stage}-", dir=_SUBPROCESS_LOG_ROOT
+        )
+    )
+    pid: int | None = None
+
+    with (
+        (log_dir / "stdout.log").open("w+b") as stdout_file,
+        (log_dir / "stderr.log").open("w+b") as stderr_file,
+        (log_dir / "events.jsonl").open("a", encoding="utf-8") as events_file,
+    ):
+
+        def report(event: str, message: str, **details) -> None:
+            record = {
+                "timestamp": _utc_now(),
+                "event": event,
+                "stage": stage,
+                "runner_pid": os.getpid(),
+                "pid": pid,
+                "elapsed": round(time.perf_counter() - start, 3),
+                **details,
+            }
+            with contextlib.suppress(OSError):
+                events_file.write(json.dumps(record) + "\n")
+                events_file.flush()
+            with contextlib.suppress(OSError):
+                safe_print(
+                    f"  [{datetime.now():%Y-%m-%d %H:%M:%S}] [{event}] "
+                    f"stage={stage} pid={pid} {message}"
+                )
+
+        report(
+            "starting",
+            f"timeout={timeout:g}s logs={log_dir}",
+            command=[str(arg) for arg in args],
+            cwd=str(Path.cwd()),
+            timeout_seconds=timeout,
+            hf_stall_seconds=_HF_DOWNLOAD_STALL_TIMEOUT,
+        )
+        progress_path = log_dir / "download_progress.json"
+        popen_kwargs: dict = {
+            "stdout": stdout_file,
+            "stderr": stderr_file,
+            "env": env,
+        }
+        if platform.system() == "Windows":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            popen_kwargs["start_new_session"] = True
+        try:
+            proc = subprocess.Popen(args, **popen_kwargs)  # noqa: S603
+        except OSError as exc:
+            report("spawn_failed", str(exc), error=str(exc))
+            raise
+        pid = proc.pid
+        report("spawned", f"timeout={timeout:g}s")
+        monitor: subprocess.Popen | None = None
+        try:
+            report("monitor_starting", "starting isolated download scan")
+            try:
+                monitor = _start_hf_download_monitor(proc.pid, env, progress_path)
+                report("monitor_started", f"monitor_pid={monitor.pid}", monitor_pid=monitor.pid)
+            except OSError as exc:
+                download_monitor_stalled = True
+                download_state_known = True
+                report("monitor_disabled", "using execution timeout", error=str(exc))
+                logger.warning("Download monitor unavailable; enforcing execution timeout.")
+
+            while True:
+                remaining = max(0.01, timeout - execution_elapsed)
+                try:
+                    proc.wait(timeout=min(_SUBPROCESS_POLL_INTERVAL, remaining))
+                    exit_code = proc.returncode
+                    break
+                except subprocess.TimeoutExpired:
+                    now = time.perf_counter()
+                    download_active = False
+                    if not download_monitor_stalled:
+                        try:
+                            snapshot = json.loads(progress_path.read_text(encoding="utf-8"))
+                        except (OSError, json.JSONDecodeError):
+                            snapshot = None
+                        if snapshot is not None:
+                            last_download_observation = snapshot["observed_at"]
+                            last_download_progress = snapshot["last_progress"]
+                            download_active = snapshot["active"]
+                            download_state_known = True
+                        if now - last_download_observation >= _HF_DOWNLOAD_MONITOR_TIMEOUT or (
+                            monitor is not None and monitor.poll() is not None
+                        ):
+                            download_monitor_stalled = True
+                            download_active = False
+                            download_state_known = True
+                            if monitor is not None:
+                                with contextlib.suppress(OSError):
+                                    monitor.kill()
+                            logger.warning(
+                                "Download monitor unavailable or stale; enforcing execution timeout."
+                            )
+                            report(
+                                "monitor_disabled",
+                                "stale or exited; using execution timeout",
+                                monitor_pid=monitor.pid if monitor is not None else None,
+                                observation_age_seconds=round(now - last_download_observation, 3),
+                            )
+
+                    if download_active:
+                        if not download_was_active:
+                            report("download_active", "execution timeout suspended")
+                        download_was_active = True
+                        if now - last_download_progress >= _HF_DOWNLOAD_STALL_TIMEOUT:
+                            hf_download_stalled = True
+                    else:
+                        if download_was_active:
+                            execution_elapsed = 0.0
+                            download_was_active = False
+                            report("execution_resumed", f"execution budget reset to {timeout:g}s")
+                        else:
+                            execution_elapsed += now - last_poll
+                        if execution_elapsed >= timeout and download_state_known:
+                            timed_out = True
+                    last_poll = now
+
+                    if now - last_heartbeat >= _SUBPROCESS_HEARTBEAT_INTERVAL:
+                        output_sizes = (
+                            os.fstat(stdout_file.fileno()).st_size,
+                            os.fstat(stderr_file.fileno()).st_size,
+                        )
+                        if output_sizes != last_output_sizes:
+                            last_output_progress = now
+                            last_output_sizes = output_sizes
+                        monitor_state = (
+                            "disabled"
+                            if download_monitor_stalled
+                            else "starting"
+                            if not download_state_known
+                            else "downloading"
+                            if download_active
+                            else "idle"
+                        )
+                        execution_remaining = max(0.0, timeout - execution_elapsed)
+                        output_idle = now - last_output_progress
+                        report(
+                            "heartbeat",
+                            f"elapsed={now - start:.1f}s exec_left={execution_remaining:.1f}s "
+                            f"monitor={monitor_state} stdout={output_sizes[0]}B "
+                            f"stderr={output_sizes[1]}B output_idle={output_idle:.1f}s",
+                            execution_remaining=round(execution_remaining, 3),
+                            monitor_state=monitor_state,
+                            monitor_age_seconds=round(now - last_download_observation, 3),
+                            hf_download_idle_seconds=round(now - last_download_progress, 3),
+                            stdout_bytes=output_sizes[0],
+                            stderr_bytes=output_sizes[1],
+                            output_idle_seconds=round(output_idle, 3),
+                        )
+                        last_heartbeat = now
+
+                    if not timed_out and not hf_download_stalled:
+                        continue
+
+                    reason = (
+                        "Hugging Face download stalled"
+                        if hf_download_stalled
+                        else f"execution timeout ({timeout:g}s)"
+                    )
+                    report(
+                        "timeout",
+                        reason,
+                        timeout=timed_out,
+                        hf_download_stalled=hf_download_stalled,
+                    )
+                    exit_code = -1
+                    break
+        except KeyboardInterrupt:
+            report("interrupted", "stopping subprocess tree; logs retained")
+            safe_print("\n  [Ctrl+C] Killing subprocess...")
+            raise
+        finally:
+            report("cleanup_starting", "reaping subprocess and download monitor")
+            if proc.poll() is None:
+                _kill_process_tree(proc.pid)
+                with contextlib.suppress(OSError):
+                    proc.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+            if monitor is not None:
+                with contextlib.suppress(OSError):
+                    monitor.kill()
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    monitor.wait(timeout=1)
+            report("cleanup_complete", f"process_returncode={proc.poll()}")
+
+        stdout_size = os.fstat(stdout_file.fileno()).st_size
+        stderr_size = os.fstat(stderr_file.fileno()).st_size
+        report("collecting_output", f"stdout={stdout_size}B stderr={stderr_size}B")
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(stdout_size).decode("utf-8", errors="replace")
+        stderr = stderr_file.read(stderr_size).decode("utf-8", errors="replace")
+        report(
+            "exited",
+            f"exit_code={exit_code} elapsed={time.perf_counter() - start:.1f}s logs={log_dir}",
+            exit_code=exit_code,
+            timeout=timed_out,
+            hf_download_stalled=hf_download_stalled,
+        )
+    if hf_download_stalled:
+        stderr += (
+            "\nError while downloading from https://huggingface.co: "
+            f"no cache progress for {_HF_DOWNLOAD_STALL_TIMEOUT:g} seconds "
+            "(Hugging Face download stalled).\n"
+        )
     elapsed = round(time.perf_counter() - start, 1)
 
     result = {
@@ -731,7 +1108,9 @@ def _run_subprocess(args: list[str], timeout: int) -> dict:
         "exit_code": exit_code,
         "elapsed": elapsed,
         "timeout": timed_out,
+        "hf_download_stalled": hf_download_stalled,
         "command": " ".join(str(a) for a in args),
+        "log_dir": str(log_dir),
     }
 
     # Retry once after clearing caches if the failure was due to disk full.
@@ -757,6 +1136,7 @@ def _run_build(
     model_dir: Path,
     ep: str | None = None,
     build_only: bool = False,
+    honor_precision: bool = False,
 ) -> dict:
     """Run winml config + winml build for one model. Returns build result dict.
 
@@ -778,6 +1158,9 @@ def _run_build(
     dict reports that effective precision back under ``precision`` (read from
     the generated config when the caller passed none), so the recorded
     eval_result never claims "no precision" for a quantized build.
+
+    ``honor_precision`` keeps an explicit release precision even on EPs whose
+    legacy evaluation track normally passes ``--no-quant``.
     """
     composite_onnx = getattr(entry, "composite_onnx", None)
     if isinstance(composite_onnx, dict) and composite_onnx:
@@ -834,7 +1217,8 @@ def _run_build(
     # written with quant=None up-front; otherwise on NPU the config command
     # would still apply its default precision (w8a16) and we'd be relying on
     # --no-quant at build time alone to override it.
-    if _should_skip_winml_quant(ep, device):
+    skip_quant = _should_skip_winml_quant(ep, device) and not (honor_precision and precision)
+    if skip_quant:
         config_args += ["--no-quant"]
 
     config_proc = _run_subprocess(config_args, timeout)
@@ -893,7 +1277,7 @@ def _run_build(
         # Mirror the --no-quant passed to winml config above so the build
         # stage also skips QDQ regardless of what the config carries (defence
         # in depth; see _should_skip_winml_quant for the rationale).
-        if _should_skip_winml_quant(ep, device):
+        if skip_quant:
             build_args += ["--no-quant"]
 
         build_proc = _run_subprocess(build_args, timeout)
@@ -1071,24 +1455,34 @@ def _run_recipe_build(
 
 
 def _extract_onnx_path(build_proc: dict, hf_id: str, task: str | None) -> str | None:
-    """Extract ONNX path from build subprocess output."""
-    # Patterns used by winml build to report the artifact path
-    markers = ("Final artifact:", "Existing artifact found:", "Artifact:")
-    onnx_path = None
-    for line in (build_proc["stderr"] + build_proc["stdout"]).splitlines():
-        for marker in markers:
-            if marker in line:
-                candidate = line.split(marker)[-1].strip()
-                if candidate and Path(candidate).exists():
-                    onnx_path = candidate
-                    break
-        if onnx_path:
-            break
+    """Extract the final or reused ONNX path from build subprocess output."""
+    # Rich may wrap a long artifact path across physical output lines. Rejoin
+    # those fragments before falling back to cache discovery.
+    markers = ("Final artifact:", "Existing artifact found:")
+    output = re.sub(
+        r"\x1b\[[0-?]*[ -/]*[@-~]",
+        "",
+        "\n".join((build_proc["stderr"], build_proc["stdout"])),
+    )
+    lines = output.splitlines()
+    for marker in markers:
+        for index, line in enumerate(lines):
+            if marker not in line:
+                continue
+            fragments = [line.split(marker, 1)[1], *lines[index + 1 : index + 11]]
+            candidate = ""
+            for fragment in fragments:
+                candidate += fragment.strip()
+                if not candidate.lower().endswith(".onnx"):
+                    continue
+                try:
+                    if Path(candidate).is_file():
+                        return candidate
+                except (OSError, ValueError) as exc:
+                    logging.debug("Skipping invalid ONNX candidate path %r: %s", candidate, exc)
+                break
 
-    if not onnx_path or not Path(onnx_path).exists():
-        onnx_path = _find_cached_model(hf_id, build_proc, task)
-
-    return onnx_path
+    return _find_cached_model(hf_id, build_proc, task)
 
 
 def _extract_task_from_config(config_path: Path) -> str | None:
@@ -1105,8 +1499,9 @@ def _find_cached_model(hf_id: str, build_proc: dict, task: str | None = None) ->
     """Try to find the built ONNX model in the WinML cache.
 
     Requires task to safely identify the correct artifact when a model has
-    multiple cached tasks (e.g. feat_* and txtcls_*). Returns None if task is
-    not provided to avoid picking the wrong model.
+    multiple cached tasks (e.g. feat_* and txtcls_*). A task can also have
+    multiple precision/config variants, so only an unambiguous single match is
+    safe. Returns None when task is absent or multiple candidates exist.
     """
     if not task:
         return None
@@ -1120,12 +1515,8 @@ def _find_cached_model(hf_id: str, build_proc: dict, task: str | None = None) ->
 
     prefix = get_task_abbrev(task) + "_"
 
-    model_files = sorted(
-        (p for p in cache_dir.glob("*_model.onnx") if p.name.startswith(prefix)),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return str(model_files[0]) if model_files else None
+    model_files = [p for p in cache_dir.glob("*_model.onnx") if p.name.startswith(prefix)]
+    return str(model_files[0]) if len(model_files) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -1655,7 +2046,9 @@ def _run_build_only(entries: list[ModelEntry], args: argparse.Namespace) -> None
         shared_dir = model_dir / "_shared"
         canonical_hash: str | None = None
 
-        safe_print(f"\n[{i}/{len(entries)}] {label}  ({entry.priority}, {entry.group})")
+        safe_print(
+            f"\n{_progress_prefix(i, len(entries))} {label}  ({entry.priority}, {entry.group})"
+        )
 
         for combo_label, ep, device in combos:
             build_dir = model_dir / combo_label if combo_label else model_dir
@@ -1833,11 +2226,7 @@ def _run_build_only(entries: list[ModelEntry], args: argparse.Namespace) -> None
 
 
 def _is_finite_number(value: object) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _validate_single_perf_result(result: dict, context: str = "result") -> str | None:
@@ -1977,6 +2366,31 @@ def _run_structured_perf(
         return proc
 
 
+def _single_physical_dml_gpu_luid() -> str:
+    """Resolve the sole physical GPU for an explicitly opted-in CI perf run."""
+    from winml.modelkit.session import EPDeviceTarget, WinMLEPRegistry
+    from winml.modelkit.sysinfo import enumerate_compute_adapters, get_ep_device_luid
+
+    native_gpus = {
+        adapter.luid: adapter
+        for adapter in enumerate_compute_adapters()
+        if adapter.device_type == "GPU"
+    }
+    if len(native_gpus) != 1:
+        raise RuntimeError(f"DML CI pin requires exactly one DXCore GPU; found {list(native_gpus)}")
+    luid, adapter = next(iter(native_gpus.items()))
+    selected = WinMLEPRegistry.instance().auto_device(EPDeviceTarget(ep="dml", device="gpu"))
+    advertised = {
+        get_ep_device_luid(device.ort_handle)
+        for device in selected.ep.devices
+        if device.device_type == "GPU"
+    }
+    if luid not in advertised:
+        raise RuntimeError(f"Physical GPU {luid} is not advertised by DML: {advertised}")
+    safe_print(f"DML CI pin: {adapter.name} (LUID: {luid}); ORT LUIDs: {advertised}")
+    return luid
+
+
 def run_model(
     entry: ModelEntry,
     device: str,
@@ -1985,6 +2399,7 @@ def run_model(
     ep: str | None = None,
     op_tracing: str | None = None,
     model_dir: Path | None = None,
+    pin_single_dml_gpu: bool = False,
 ) -> dict:
     """Execute winml perf for one or more ONNX models. Returns merged result dict.
 
@@ -1998,6 +2413,11 @@ def run_model(
     ``model_dir`` as ``op_trace.json`` (suffixed with the sub-model label for
     composite models).
     """
+    if pin_single_dml_gpu and (
+        device != "gpu" or _effective_ep(ep, device) != "DmlExecutionProvider"
+    ):
+        raise ValueError("--pin-single-dml-gpu requires --ep dml --device gpu")
+    device_luid = _single_physical_dml_gpu_luid() if pin_single_dml_gpu else None
     trace = bool(op_tracing) and model_dir is not None
 
     if not onnx_paths:
@@ -2025,6 +2445,8 @@ def run_model(
         if trace:
             args += ["--op-tracing", op_tracing]
         args += entry.perf_args
+        if device_luid:
+            args += ["--device-luid", device_luid]
 
         proc = _run_structured_perf(args, timeout, model_dir, copy_op_trace=trace)
         proc["device"] = device
@@ -2060,6 +2482,8 @@ def run_model(
         if trace:
             args += ["--op-tracing", op_tracing]
         args += entry.perf_args
+        if device_luid:
+            args += ["--device-luid", device_luid]
 
         proc = _run_structured_perf(
             args,
@@ -2429,10 +2853,10 @@ def _run_update_baseline(entries: list[ModelEntry], args: argparse.Namespace) ->
         ds_config = get_dataset_config(entry.hf_id, entry.task) or {}
         cached = _lookup_baseline_cache(entry.hf_id, entry.task, ds_config)
         if cached is not None and not args.retry_failed:
-            safe_print(f"[{i}/{len(entries)}] {label}  (cached {cached['metric']})")
+            safe_print(f"{_progress_prefix(i, len(entries))} {label}  (cached {cached['metric']})")
             continue
 
-        safe_print(f"[{i}/{len(entries)}] {label}  running baseline ...")
+        safe_print(f"{_progress_prefix(i, len(entries))} {label}  running baseline ...")
         _build_dataset(ds_config, args.timeout)
         baseline = _run_pytorch_baseline(entry, args.device, args.timeout)
         if baseline["status"] == "PASS":
@@ -2597,9 +3021,7 @@ def _matches_hf_fetch_retry(existing: dict) -> bool:
     accuracy = existing.get("accuracy") or {}
     perf_failed = bool(perf) and not perf.get("passed")
     accuracy_failed = (
-        bool(accuracy)
-        and not accuracy.get("skipped")
-        and accuracy_status(accuracy) != "PASS"
+        bool(accuracy) and not accuracy.get("skipped") and accuracy_status(accuracy) != "PASS"
     )
     if not perf_failed and not accuracy_failed:
         return False
@@ -2685,11 +3107,17 @@ class EvalJob:
     one job per NPU quantization scheme (see :data:`_NPU_FALLBACK_PRECISIONS`);
     it stays ``None`` for the single default-precision fallback. Each job
     produces one ``eval_result.json``.
+
+    ``precision_locked`` fixes the selected config precision for release jobs.
+    Recipes keep their authored configuration; fallback builds pass a non-default
+    label as a precision flag without applying legacy expansion/skip-quant policy.
+    The label is not a measurement of the produced ONNX tensor dtypes.
     """
 
     entry: ModelEntry
     variant: RecipeVariant | None
     fallback_precision: str | None = None
+    precision_locked: bool = False
 
     @property
     def precision(self) -> str | None:
@@ -2705,6 +3133,14 @@ class EvalJob:
         return self.fallback_precision or self.entry.precision
 
 
+def _model_sort_key(entry: ModelEntry) -> tuple[int, str]:
+    """Sort P0-P3 models by priority, then case-insensitive model ID."""
+    return (
+        _PRIORITY_RANK.get(entry.priority.upper(), len(_PRIORITY_RANK)),
+        entry.hf_id.casefold(),
+    )
+
+
 def _is_quantized_precision(precision: str) -> bool:
     """True if a recipe precision implies quantization.
 
@@ -2718,9 +3154,18 @@ def _is_quantized_precision(precision: str) -> bool:
 
 
 def _build_jobs(
-    entries: list[ModelEntry], recipes_dir: Path | None, device: str, ep: str | None = None
+    entries: list[ModelEntry],
+    recipes_dir: Path | None,
+    device: str,
+    ep: str | None = None,
+    *,
+    release: bool = False,
 ) -> list[EvalJob]:
     """Expand entries into jobs. Recipes apply on every device; quant is NPU-only.
+
+    With ``release=True``, create exactly one selected-config job per entry,
+    including a single fallback for ``default``. This mode can use a quantized
+    GPU recipe when the manifest selected it; legacy expansion is bypassed.
 
     Automatic EP/device axes are resolved through the runtime target policy
     before recipe lookup so target-specific directories always use concrete
@@ -2766,6 +3211,12 @@ def _build_jobs(
             if recipes_dir is not None
             else []
         )
+        if release:
+            matching = next(
+                (variant for variant in variants if variant.precision == entry.precision), None
+            )
+            jobs.append(EvalJob(entry, matching, precision_locked=True))
+            continue
         if not npu or skip_quant:
             # Off-NPU and skip-quant EPs still use recipes for their eval
             # config, but drop quantized variants -- quantization here is only
@@ -2778,12 +3229,14 @@ def _build_jobs(
             # explicit per-model precision (e.g. fp16) skips this and is honored
             # by the single-fallback branch below via _resolve_precision.
             jobs.extend(
-                EvalJob(entry, None, fallback_precision=prec)
-                for prec in _NPU_FALLBACK_PRECISIONS
+                EvalJob(entry, None, fallback_precision=prec) for prec in _NPU_FALLBACK_PRECISIONS
             )
         else:
             jobs.append(EvalJob(entry, None))
-    return jobs
+    return sorted(
+        jobs,
+        key=lambda job: _model_sort_key(job.entry),
+    )
 
 
 def _build_for_job(
@@ -2796,6 +3249,9 @@ def _build_for_job(
     otherwise the ``winml config`` fallback is used. ``recipe_meta`` is the
     eval/dataset config for ``winml eval -c`` (None for the fallback) and
     ``trust`` is whether the recipe's dataset needs ``--trust-remote-code``.
+    Release checks compare declared case/recipe labels, not the loaded recipe's
+    quantization config or the ONNX artifact's dtypes. Recipes are not converted
+    to match a label: preserving their configuration preserves the historical case.
     """
     if job.variant is not None:
         build_result = _run_recipe_build(
@@ -2810,13 +3266,26 @@ def _build_for_job(
         build_result = _run_build(
             job.entry,
             args.device,
-            _resolve_precision(args.device, explicit_precision, ep=args.ep),
+            explicit_precision
+            if job.precision_locked
+            else _resolve_precision(args.device, explicit_precision, ep=args.ep),
             args.timeout,
             model_dir,
             ep=args.ep,
+            **({"honor_precision": True} if job.precision_locked else {}),
         )
         recipe_meta = None
         trust = False
+    if (
+        job.precision_locked
+        and job.precision is not None
+        and build_result["success"]
+        and build_result.get("precision") != job.precision
+    ):
+        raise ValueError(
+            f"Release precision mismatch for {job.entry.hf_id}/{job.entry.task}: "
+            f"requested {job.precision}, built {build_result.get('precision')}"
+        )
     return build_result, recipe_meta, trust
 
 
@@ -2904,15 +3373,25 @@ def parse_args() -> argparse.Namespace:
         choices=["P0", "P1", "P2", "P3"],
         default=["P0", "P1", "P2", "P3"],
         metavar="{P0,P1,P2,P3}",
-        help=(
-            "Filter by priority. Pass one or more, e.g. --priority P0 P1. "
-            "Default: P0 P1 P2 P3."
-        ),
+        help=("Filter by priority. Pass one or more, e.g. --priority P0 P1. Default: P0 P1 P2 P3."),
+    )
+    parser.add_argument(
+        "--release",
+        action="store_true",
+        help="Evaluate the fixed release manifest at each model's selected target precision.",
     )
     parser.add_argument("--model-type", help="Filter by model_type")
     parser.add_argument("--group", help="Filter by group")
     parser.add_argument("--device", default="auto", help="Target device (default: auto)")
     parser.add_argument("--ep", default=None, help="Execution provider (e.g. qnn, dml, ov)")
+    parser.add_argument(
+        "--pin-single-dml-gpu",
+        action="store_true",
+        help=(
+            "CI workaround for RDP duplicate adapters: pin perf to the sole DXCore GPU. "
+            "Requires --ep dml --device gpu --eval-type perf."
+        ),
+    )
     parser.add_argument(
         "--update-baseline",
         dest="update_baseline",
@@ -3023,6 +3502,16 @@ def parse_args() -> argparse.Namespace:
         "--timeout", type=int, default=600, help="Per-subprocess timeout in seconds (default: 600)"
     )
     parser.add_argument(
+        "--hf-download-stall-timeout",
+        type=int,
+        default=_DEFAULT_HF_DOWNLOAD_STALL_TIMEOUT,
+        help=(
+            "Hugging Face download inactivity timeout in seconds; active download "
+            "time is excluded and --timeout restarts after download completion "
+            f"(default: {_DEFAULT_HF_DOWNLOAD_STALL_TIMEOUT})"
+        ),
+    )
+    parser.add_argument(
         "--clean-cache",
         dest="clean_cache",
         nargs="*",
@@ -3087,7 +3576,40 @@ def parse_args() -> argparse.Namespace:
             "Implies --continue for passing jobs."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.release:
+        conflict_names = (
+            "priority",
+            "hf_model",
+            "registry",
+            "task",
+            "group",
+            "model_type",
+            "build_only",
+            "update_baseline",
+        )
+        explicit_args = parser.parse_args(
+            namespace=argparse.Namespace(**dict.fromkeys(conflict_names))
+        )
+        conflicts = [
+            f"--{name.replace('_', '-')}"
+            for name in conflict_names
+            if getattr(explicit_args, name) is not None
+        ]
+        if conflicts:
+            parser.error(f"--release cannot be combined with {', '.join(conflicts)}")
+    if args.pin_single_dml_gpu and (
+        args.device != "gpu"
+        or args.eval_type != "perf"
+        or args.build_only
+        or args.update_baseline
+        or _effective_ep(args.ep, args.device) != "DmlExecutionProvider"
+    ):
+        parser.error(
+            "--pin-single-dml-gpu requires --ep dml --device gpu --eval-type perf "
+            "(not build/baseline-only)"
+        )
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -3097,12 +3619,33 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     """Run E2E evaluation pipeline."""
+    global _HF_DOWNLOAD_STALL_TIMEOUT
+
     args = parse_args()
+    if args.hf_download_stall_timeout <= 0:
+        raise ValueError("--hf-download-stall-timeout must be positive")
+    _HF_DOWNLOAD_STALL_TIMEOUT = float(args.hf_download_stall_timeout)
     clean_cache_targets = _resolve_clean_cache_targets(args.clean_cache)
     args.clean_cache_targets = clean_cache_targets
 
+    if not (
+        args.list or args.list_json or args.update_baseline or args.build_only
+    ) and not _is_eval_target_available(args.ep, args.device):
+        return
+
     # 1. Load registry
-    if args.hf_model:
+    release_mode = args.release
+    if release_mode:
+        args.ep, args.device = _resolve_eval_target(args.ep, args.device)
+        entries, args.release_target = load_release_registry(
+            _RELEASE_MANIFEST,
+            load_registry(args.registry),
+            ep=args.ep,
+            device=args.device,
+            output_dir=args.output_dir,
+        )
+        safe_print(f"Release: {_RELEASE_MANIFEST} | Target: {args.release_target}")
+    elif args.hf_model:
         # Try to find the model in the registry (preserves dataset_config, etc.)
         matched_entry: ModelEntry | None = None
         try:
@@ -3146,6 +3689,7 @@ def main() -> None:
     if not entries:
         safe_print("No models matched the filters.")
         sys.exit(1)
+    entries.sort(key=_model_sort_key)
 
     # Register dataset configs from registry entries as fallback
     register_from_registry(entries)
@@ -3156,8 +3700,9 @@ def main() -> None:
         for e in entries:
             ds = get_dataset_config(e.hf_id, e.task)
             skip_acc = "" if args.eval_type == "perf" else "  [task_default]" if ds is None else ""
+            precision_label = f"  [precision={e.precision or 'default'}]" if release_mode else ""
             safe_print(
-                f"  [{e.priority}] {e.hf_id} / {e.task}  ({e.model_type}, {e.group}){skip_acc}"
+                f"  [{e.priority}] {e.hf_id} / {e.task}  ({e.model_type}, {e.group}){precision_label}{skip_acc}"
             )
         sys.exit(0)
 
@@ -3174,7 +3719,12 @@ def main() -> None:
             filtered: list[ModelEntry] = []
             skipped_count = 0
             for e in entries:
-                result_path = model_result_dir(output_dir, e.hf_id, e.task) / "eval_result.json"
+                result_path = (
+                    model_result_dir(
+                        output_dir, e.hf_id, e.task, e.precision if release_mode else None
+                    )
+                    / "eval_result.json"
+                )
                 if args.continue_run and result_path.exists():
                     try:
                         existing = load_result_json(result_path)
@@ -3200,6 +3750,11 @@ def main() -> None:
                 "model_type": e.model_type,
                 "group": e.group,
                 "priority": e.priority,
+                **(
+                    {"precision": e.precision, "release_target": args.release_target}
+                    if release_mode
+                    else {}
+                ),
             }
             for e in entries
         ]
@@ -3272,7 +3827,7 @@ def main() -> None:
             f"Recipe copy: {copied_count} configs from {source_ep}/{source_device} "
             f"to {args.ep}/{args.device}"
         )
-    jobs = _build_jobs(entries, recipes_dir, args.device, ep=args.ep)
+    jobs = _build_jobs(entries, recipes_dir, args.device, ep=args.ep, release=release_mode)
     total_jobs = len(jobs)
 
     safe_print(f"E2E Evaluation: {len(entries)} models -> {total_jobs} jobs -> {output_dir}")
@@ -3281,7 +3836,11 @@ def main() -> None:
         f"Device: {args.device} | EP: {ep_label} | Timeout: {args.timeout}s | Eval: {args.eval_type}"
     )
     safe_print(f"Disk free: {_get_disk_free_gb():.1f} GB")
-    if recipes_dir is not None and args.device == "npu":
+    if release_mode:
+        safe_print(
+            "Release jobs: one precision per model from the manifest; matching recipe or winml config fallback"
+        )
+    elif recipes_dir is not None and args.device == "npu":
         safe_print(
             f"Recipes: {recipes_dir}  "
             f"(NPU; winml config {'+'.join(_NPU_FALLBACK_PRECISIONS)} fallback when a model has none)"
@@ -3351,7 +3910,7 @@ def main() -> None:
         )
         if timeout_rule is not None:
             reason = timeout_rule.get("reason") or "timeout"
-            safe_print(f"\n[{i}/{total_jobs}] {label}  (SKIP - TIMEOUT: {reason})")
+            safe_print(f"\n{_progress_prefix(i, total_jobs)} {label}  (SKIP - TIMEOUT: {reason})")
             model_dir.mkdir(parents=True, exist_ok=True)
             timeout_result = build_eval_result(
                 entry=entry,
@@ -3389,7 +3948,8 @@ def main() -> None:
                     perf_tag = "PASS" if perf.get("passed") else f"FAIL/{perf_cls}"
                     acc_tag = f"  acc={accuracy_status(acc)}" if acc is not None else ""
                     safe_print(
-                        f"\n[{i}/{total_jobs}] {label}  (SKIP - {perf_tag}{acc_tag}, cached)"
+                        f"\n{_progress_prefix(i, total_jobs)} {label}  "
+                        f"(SKIP - {perf_tag}{acc_tag}, cached)"
                     )
                     continue
 
@@ -3397,19 +3957,26 @@ def main() -> None:
                     # Perf already recorded (and passed); only (re)build + run
                     # accuracy, then merge it into the existing result.
                     backfill_existing = existing
-                    safe_print(f"\n[{i}/{total_jobs}] {label}  (BACKFILL accuracy - perf cached)")
+                    safe_print(
+                        f"\n{_progress_prefix(i, total_jobs)} {label}  "
+                        "(BACKFILL accuracy - perf cached)"
+                    )
                 else:
                     retry_label = classify_result(existing) or (
                         accuracy_status(existing.get("accuracy"))
                         if existing.get("accuracy")
                         else "?"
                     )
-                    safe_print(f"\n[{i}/{total_jobs}] {label}  (RETRY - was {retry_label})")
+                    safe_print(
+                        f"\n{_progress_prefix(i, total_jobs)} {label}  (RETRY - was {retry_label})"
+                    )
             except (json.JSONDecodeError, KeyError):
                 pass  # Corrupted result file — re-run
 
         if backfill_existing is None:
-            safe_print(f"\n[{i}/{total_jobs}] {label}  ({entry.priority}, {entry.group})")
+            safe_print(
+                f"\n{_progress_prefix(i, total_jobs)} {label}  ({entry.priority}, {entry.group})"
+            )
 
         try:
             perf_proc: dict | None = None
@@ -3478,6 +4045,7 @@ def main() -> None:
                     ep=args.ep,
                     op_tracing=op_tracing,
                     model_dir=model_dir,
+                    pin_single_dml_gpu=args.pin_single_dml_gpu,
                 )
             else:
                 # "both": perf runs first; accuracy only when perf passes.
