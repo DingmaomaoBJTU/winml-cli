@@ -23,7 +23,6 @@ import ast
 import logging
 from importlib import import_module
 from pathlib import Path
-from time import sleep
 from typing import TYPE_CHECKING
 
 import click
@@ -100,7 +99,6 @@ def _print_banner(
 ) -> None:
     """Print the selected WinML CLI banner to stderr using Rich."""
     from rich.console import Console, Group  # lazy import - keeps startup fast
-    from rich.live import Live
     from rich.text import Text
 
     margin = "  "
@@ -138,7 +136,7 @@ def _print_banner(
             Text.from_markup(f"{margin}[bold rgb(160,100,255)]Windows ML[/]  ·  {tagline}"),
         ]
         if include_version:
-            lines.append(Text.from_markup(f"{margin}[dim]v{version}  ·  CPU · GPU · NPU[/]"))
+            lines.append(Text.from_markup(f"{margin}v{version}  ·  CPU · GPU · NPU"))
         lines.append(Text())
         return lines
 
@@ -191,7 +189,7 @@ def _print_banner(
 
     def capsule(frame: int | None = None) -> Group:
         logo_lines = wordmark(frame, compact=True)
-        version_text = Text.from_markup(f"[dim]v{version}  ·  CPU · GPU · NPU[/]")
+        version_text = Text.from_markup(f"v{version}  ·  CPU · GPU · NPU")
         version_line = Text(" " * ((compact_width - len(version_text)) // 2))
         version_line.append_text(version_text)
         version_line.append(" " * (compact_width - len(version_line)))
@@ -212,7 +210,7 @@ def _print_banner(
 
         lines = [
             Text(),
-            Text.from_markup(f"{margin}[dim]Windows ML CLI[/]"),
+            Text.from_markup(f"{margin}Windows ML CLI"),
             gradient_line(f"{frame_margin}┏{'━' * (content_width + 4)}┓", frame),
             framed_line(),
         ]
@@ -275,25 +273,14 @@ def _print_banner(
 
     if style == "capsule":
         render = capsule
-        frames = range(-4, art_width + 5, 4)
-        delay = 0.02
     elif style == "tiles":
         render = tiles
-        frames = range(5)
-        delay = 0.07
     elif style == "prompt":
         render = prompt
-        frames = range(0, art_width + 5, 4)
-        delay = 0.02
     else:
         raise ValueError(f"Unknown banner style: {style}")
 
-    if con.is_terminal and con.color_system is not None and con.width >= art_width + 6:
-        with Live(render(frames[0]), console=con, auto_refresh=False, transient=True) as live:
-            for frame in frames[1:]:
-                live.update(render(frame), refresh=True)
-                sleep(delay)
-
+    # Static help avoids stale animation frames in terminal scrollback.
     con.print(render())
 
 

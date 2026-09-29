@@ -164,7 +164,7 @@ class TestWinmlHelp:
         assert marker in result.stderr
 
     def test_banner_animation_is_skipped_outside_interactive_terminals(self) -> None:
-        with patch("winml.modelkit.cli.sleep") as mock_sleep:
+        with patch("time.sleep") as mock_sleep:
             _print_banner(
                 "1.2.3",
                 _console=Console(
@@ -176,8 +176,9 @@ class TestWinmlHelp:
             mock_sleep.assert_not_called()
 
     @pytest.mark.parametrize("style", ["capsule", "tiles", "prompt"])
-    def test_each_banner_style_animates_in_interactive_terminals(self, style: str) -> None:
-        with patch("winml.modelkit.cli.sleep") as mock_sleep:
+    @pytest.mark.parametrize("width", [80, 81, 82, 100])
+    def test_interactive_banner_is_static(self, style: str, width: int) -> None:
+        with patch("time.sleep") as mock_sleep:
             _print_banner(
                 "1.2.3",
                 style,
@@ -185,10 +186,10 @@ class TestWinmlHelp:
                     file=StringIO(),
                     force_terminal=True,
                     color_system="truecolor",
-                    width=100,
+                    width=width,
                 ),
             )
-            assert mock_sleep.call_count > 1
+            mock_sleep.assert_not_called()
 
     def test_unknown_banner_style_is_rejected(self) -> None:
         result = _invoke("--banner-style", "unknown", "--help")
